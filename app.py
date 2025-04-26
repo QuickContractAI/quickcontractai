@@ -9,6 +9,7 @@ import re
 import time
 import json
 from typing import List, Dict, Any, Optional, Tuple
+import difflib
 
 
 # LangChain imports
@@ -260,9 +261,9 @@ class SnowflakeCortexRetriever:
         
 # --- Model Initialization ---
 def get_refiner_model():
-    """Get the TinyLlama model for input refinement"""
+    """Get the gemma3 model for input refinement"""
     return Ollama(
-        model="tinyllama",
+        model="gemma3:12b-it-qat",
         callbacks=[StreamingStdOutCallbackHandler()],
         temperature=0.1,
     )
@@ -293,7 +294,7 @@ def get_draft_model():
     return ChatGoogleGenerativeAI(
         model="gemini-2.5-pro-exp-03-25",
         google_api_key=api_key,
-        temperature=0.7,
+        temperature=0.5,
     )
 
 # --- LangChain Chain Definitions ---
@@ -302,20 +303,22 @@ def create_refinement_chain():
     llm = get_refiner_model()
     
     template = """
-    You are a helpful assistant tasked with refining and improving contract language.
+    You are a helpful assistant tasked with refining and improving legal contract language.
     Review the following input for a {field_name} in a {contract_type} contract.
     Your task is to check for:
     1. Grammar and clarity issues
     2. Placeholder text that needs to be replaced (like [X], $[Value], etc.)
     3. Incomplete sentences or unclear language
     
+    CONTEXT:
+    {context}
+
     Original input:
     {original_text}
     
     If you find issues, improve the text while preserving the original intent.
-    If you find placeholder text that needs user attention, prefix your response with "[Review Recommended: Found placeholder]"
     
-    Return the improved text only, without explanations or additional formatting.
+    Return the improved text only, strictly WITHOUT explanations or additional formatting. Also, don't generate alternatives to suggested reviews.
     """
     
     prompt = PromptTemplate(
@@ -698,87 +701,185 @@ US_STATES = [
     "Virginia", "Washington", "West Virginia", "Wisconsin", "Wyoming"
 ]
 
-# --- Contract Generation Functions ---
-def refine_text_field(original_text, field_context_label, contract_type):
-    """Refine text field using TinyLlama"""
+# --- Contract Generation Functions --
+def refine_text_field(original_text, field_context_label, contract_type, all_inputs=None):
+    """Refine text field using Llama 3.2 with context from other relevant fields"""
     try:
+        # Skip refinement for certain fields
+        if field_context_label.lower().endswith("address") and len(original_text.split(",")) <= 1:
+            return f"{original_text}, [City], [State] [ZIP]"  
+                    
         llm = get_refiner_model()
         
+        # Build context dictionary of relevant fields based on contract type
+        context_fields = {}
+        if all_inputs:
+            # Common fields to always include
+            for key in ['client_name', 'provider_name', 'employer_name', 'employee_name', 
+                        'landlord_name', 'tenant_name']:
+                if key in all_inputs and all_inputs[key]:
+                    context_fields[key] = all_inputs[key]
+            
+            # Add relevant fields based on contract type
+            if contract_type == "Service Agreement":
+                relevant_keys = ['client_name', 'provider_name', 'start_date', 'end_date']
+            elif contract_type == "Employment Agreement":
+                relevant_keys = ['employer_name', 'employee_name', 'position', 'salary', 'start_date']
+            elif contract_type == "Residential Lease Agreement":
+                relevant_keys = ['landlord_name', 'tenant_name', 'property_address', 
+                                 'rent_amount', 'rent_due_date', 'start_date', 'end_date']
+            
+            for key in relevant_keys:
+                if key in all_inputs and all_inputs[key]:
+                    # Convert dates to string format
+                    if isinstance(all_inputs[key], date):
+                        context_fields[key] = all_inputs[key].strftime('%Y-%m-%d')
+                    else:
+                        context_fields[key] = all_inputs[key]
+        
+        # Build context string
+        context_str = "\n".join([f"{key.replace('_', ' ').title()}: {value}" 
+                               for key, value in context_fields.items()])
+        
         template = """
-        You are a helpful assistant tasked with refining and improving contract language.
-        Review the following input for a {field_name} in a {contract_type} contract.
-        
-        Your task is to check for:
-        1. Grammar and clarity issues
-        2. Placeholder text that needs to be replaced (like [X], $[Value], etc.)
-        3. Incomplete sentences or unclear language
-        
-        Original input:
+        You are refining text for a {field_name} in a {contract_type} contract.
+
+        CONTEXT:
+        {context}
+
+        ORIGINAL TEXT:
         {original_text}
-        
-        If you find issues, improve the text while preserving the original intent.
-        If you find placeholder text that needs user attention, prefix your response with "[Review Recommended: Found placeholder]"
-        
-        Return ONLY the improved text, without explanations or additional formatting.
+
+        Your task:
+        1. Fix grammar and clarity issues
+        2. Replace placeholders with actual values from context
+        3. Make language more complete and professional
+
+        IMPORTANT FORMATTING RULES:
+        - DO NOT include any prefix like "[Review Recommended:]" 
+        - DO NOT include any "Alternatively:" sections
+        - DO NOT include "Note:" or explanations of your changes
+        - DO NOT include instructions or comments to the user
+        - Return ONLY the improved text without any additional formatting or commentary
+        - If the original text is already good, return exactly the same text
+
+        Output should be ONLY the plain text with NO prefixes or tags.
         """
         
-        prompt = PromptTemplate(
-            input_variables=["field_name", "contract_type", "original_text"],
-            template=template,
-        )
-        
-        # Run the LLM directly instead of using a chain
-        input_text = prompt.format(
+        # Run the LLM directly
+        input_text = template.format(
             field_name=field_context_label,
             contract_type=contract_type,
+            context=context_str,
             original_text=original_text
         )
         
         result = llm.invoke(input_text)
         
         # Clean up the result
-        result_text = result.strip()
+        result_text = clean_llm_output(result.strip(), original_text)
         
-        # Check if the result is excessively long (indicates the model might have repeated the prompt or instructions)
-        if len(result_text) > len(original_text) * 3 and len(result_text) > 500:
-            logger.warning(f"Result suspiciously long for '{field_context_label}'. Trimming.")
-            
-            # Try to extract just the improved text by looking for the original text and taking what follows
-            # or by finding common patterns in the output
-            lines = result_text.split('\n')
-            cleaned_lines = []
-            recording = False
-            
-            for line in lines:
-                # Skip lines that are clearly instructions or explanations
-                if any(x in line.lower() for x in ["original input:", "task is to check", "grammar and clarity", 
-                                                  "placeholder text", "incomplete sentences", 
-                                                  "return only the", "without explanation"]):
-                    continue
-                
-                # Start recording after we see indicators that the actual content is starting
-                if "improved text" in line.lower() or "recommended text" in line.lower():
-                    recording = True
-                    continue
-                
-                if recording:
-                    cleaned_lines.append(line)
-            
-            if cleaned_lines:
-                result_text = "\n".join(cleaned_lines).strip()
-            else:
-                # Fallback - just return a sanitized version of the original
-                logger.warning(f"Failed to extract refined text for '{field_context_label}'. Using original.")
-                return original_text
-        
-        if not result_text:
-            logger.warning(f"Empty response for '{field_context_label}'. Using original.")
+        # If result is very similar to original, just return original
+        if is_essentially_same(result_text, original_text):
             return original_text
             
         return result_text
     except Exception as e:
         logger.error(f"Error during refinement for '{field_context_label}': {e}", exc_info=True)
         return original_text
+
+def clean_llm_output(output_text, original_text):
+    """Clean LLM output to remove common instruction artifacts"""
+    
+    # Remove common instruction patterns
+    patterns_to_remove = [
+        r"ORIGINAL TEXT:.*?(?=\n\n)",
+        r"IMPROVED TEXT:.*?\n",
+        r"CONTEXT:.*?(?=\n\n)",
+        r"Your task is to.*?\n",
+        r"Return ONLY the improved.*?\n",
+        r"If you find issues.*?\n",
+        r"If the original text is already.*?\n"
+    ]
+    
+    cleaned_text = output_text
+    for pattern in patterns_to_remove:
+        cleaned_text = re.sub(pattern, "", cleaned_text, flags=re.DOTALL | re.IGNORECASE)
+    
+    # Check for review needed (for UI warning flag)
+    needs_review = False
+    placeholder_pattern = r"\[review recommended:.*?\]"
+    if re.search(placeholder_pattern, cleaned_text.lower()):
+        needs_review = True
+    
+    # Further cleaning - split into lines and remove instruction-like lines
+    lines = cleaned_text.split('\n')
+    cleaned_lines = []
+    
+    # Remove "Alternatively:" sections, notes, and ALL review recommendations
+    in_alternative_section = False
+    
+    for line in lines:
+        line_lower = line.lower().strip()
+        
+        # Skip instruction-like lines
+        if any(keyword in line_lower for keyword in [
+            "original text:", "improved text:", "return only", "task is to", 
+            "grammar and clarity", "incomplete sentences"
+        ]):
+            continue
+            
+        # Skip "Alternatively:" sections
+        if line_lower.startswith("alternatively:"):
+            in_alternative_section = True
+            continue
+            
+        if in_alternative_section and line_lower.strip() == "":
+            in_alternative_section = False
+            
+        if in_alternative_section:
+            continue
+            
+        # Skip notes at the end
+        if line_lower.startswith("note:"):
+            continue
+            
+        # Remove ALL review recommendation prefixes
+        if "[review recommended:" in line_lower:
+            # Remove the prefix and keep only the content after "]"
+            content = re.sub(r"\[review recommended:.*?\]", "", line, flags=re.IGNORECASE).strip()
+            if content:  # Only add if there's content left
+                cleaned_lines.append(content)
+        else:
+            cleaned_lines.append(line)
+    
+    # Join and strip
+    final_text = "\n".join(cleaned_lines).strip()
+    
+    # If we've lost too much, return original
+    if len(final_text) < len(original_text) * 0.5 and len(original_text) > 20:
+        return original_text
+        
+    # Store the needs_review flag in the context where appropriate
+    # This can be done via return value or other mechanism
+    return final_text
+
+def is_essentially_same(text1, text2):
+    """Check if two texts are essentially the same, ignoring whitespace and case"""
+    if text1 is None or text2 is None:
+        return False
+        
+    # Normalize both texts
+    t1 = re.sub(r'\s+', ' ', text1.lower()).strip()
+    t2 = re.sub(r'\s+', ' ', text2.lower()).strip()
+    
+    # If they're exactly the same after normalization
+    if t1 == t2:
+        return True
+        
+    # Calculate similarity ratio
+    similarity = difflib.SequenceMatcher(None, t1, t2).ratio()
+    return similarity > 0.9  # 90% similar is "essentially the same"
 
 def get_precedent_extracts(input_data, contract_type, jurisdiction):
     """Get relevant precedent extracts from Snowflake Cortex Search Service"""
@@ -1265,32 +1366,53 @@ def main():
                     st.session_state.review_data = {}
                     st.session_state.final_input_data = {}
                     
+                    # In the review stage, when processing inputs
                     with st.spinner("Analyzing inputs for refinement..."):
                         questions_for_type = AGREEMENT_QUESTIONS.get(st.session_state.agreement_type, [])
+
+                        # Process refinable fields
                         for q in questions_for_type:
                             field_key = q['key']
                             original_value = st.session_state.initial_input_data.get(field_key)
                             
                             # Check if refinement is enabled for this field
                             if q.get("refine", False) and isinstance(original_value, str) and original_value.strip():
-                                suggested_value = refine_text_field(
-                                    str(original_value), 
-                                    q['label'], 
-                                    st.session_state.agreement_type
-                                )
+                                # Determine if this field should be skipped based on type
+                                should_skip = False
                                 
-                                # Store original and suggestion for review stage
-                                st.session_state.review_data[field_key] = {
-                                    'original': str(original_value), 
-                                    'suggested': suggested_value
-                                }
+                                # Skip address fields that already have city/state/zip
+                                if "address" in field_key.lower():
+                                    parts = original_value.split(',')
+                                    if len(parts) >= 3 and any(p.strip().isdigit() for p in parts):
+                                        # Already has city, state, zip format
+                                        should_skip = True
                                 
-                                # Pre-populate final data with the suggestion
-                                st.session_state.final_input_data[field_key] = suggested_value
+                                if not should_skip:
+                                    # Pass all input data as context
+                                    suggested_value = refine_text_field(
+                                        str(original_value), 
+                                        q['label'], 
+                                        st.session_state.agreement_type,
+                                        st.session_state.initial_input_data  # Pass all inputs as context
+                                    )
+                                    
+                                    # Only store for review if actually different
+                                    if suggested_value != original_value:
+                                        st.session_state.review_data[field_key] = {
+                                            'original': str(original_value), 
+                                            'suggested': suggested_value
+                                        }
+                                        st.session_state.final_input_data[field_key] = suggested_value
+                                    else:
+                                        # If no changes, use original directly
+                                        st.session_state.final_input_data[field_key] = original_value
+                                else:
+                                    # Skip refinement for this field
+                                    st.session_state.final_input_data[field_key] = original_value
                             else:
-                                # If no refinement, directly use the original input for the final data
+                                # No refinement for this field
                                 st.session_state.final_input_data[field_key] = original_value
-                    
+
                     st.session_state.app_stage = 'review'
                     st.rerun()
     
