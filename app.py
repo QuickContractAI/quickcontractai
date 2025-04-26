@@ -10,8 +10,10 @@ import time
 import json
 from typing import List, Dict, Any, Optional, Tuple
 import difflib
+from contract_analysis import render_contract_analysis_tab
 from cuad_few_shots import get_few_shots
 from privacy import redact_inputs, restore_pii, describe_redaction
+
 
 
 # LangChain imports
@@ -271,7 +273,7 @@ def get_refiner_model():
     )
 
 def get_validation_model():
-    """Get the ShieldGemma model for validation"""
+    """Get the Qwen model for validation"""
     return Ollama(
         model="qwen2.5-coder:14b",
         callbacks=[StreamingStdOutCallbackHandler()],
@@ -279,7 +281,7 @@ def get_validation_model():
     )
 
 def get_consistency_model():
-    """Get the Phi4 model for consistency validation"""
+    """Get the Deepseek model for consistency validation"""
     return Ollama(
         model="deepseek-r1:14b",
         callbacks=[StreamingStdOutCallbackHandler()],
@@ -1463,7 +1465,7 @@ def generate_contract(contract_type, jurisdiction, input_data):
 # --- Streamlit App UI ---
 def main():
     st.title(APP_NAME)
-    st.caption("Generate legal agreement drafts with AI assistance. Review is essential.")
+    st.caption("Generate and analyze legal agreement drafts with AI assistance. Review is essential.")
     
     # Initialize session state
     if 'app_stage' not in st.session_state:
@@ -1484,9 +1486,20 @@ def main():
         st.session_state.jurisdiction = US_STATES[default_jurisdiction_index]
     if 'generated_text' not in st.session_state:
         st.session_state.generated_text = None
+    if 'active_tab' not in st.session_state:
+        st.session_state.active_tab = 'generate'
     
     # Sidebar selectors
     st.sidebar.header("Contract Options")
+    
+    # Only show Generate/Analyze tabs if we're in the final stage
+    if st.session_state.app_stage == 'done':
+        st.session_state.active_tab = st.sidebar.radio(
+            "Mode:",
+            options=['Generate', 'Analyze'],
+            index=0 if st.session_state.active_tab == 'generate' else 1,
+            key="mode_selector"
+        ).lower()
     
     agreement_type_options = list(AGREEMENT_QUESTIONS.keys())
     try:
@@ -1786,93 +1799,114 @@ def main():
                 st.session_state.app_stage = 'done'
                 st.rerun()
                 
+        # This replaces the existing code in the 'done' stage of your main() function
         if st.session_state.app_stage == 'done':
-            st.header(f"Generated Draft: {st.session_state.agreement_type}")
-            st.subheader(f"Governing Law: {st.session_state.jurisdiction}")
-            st.markdown("---")
-            
-            generated_text = st.session_state.get('generated_text', None)
-            
-            if not generated_text:
-                st.error("Document generation failed. No text was produced.")
-            elif isinstance(generated_text, str):
-                # Generation succeeded, proceed to PDF creation
-                st.success("Generation complete. Preparing PDF...")
+            # Check which tab is active
+            if st.session_state.active_tab == 'generate':
+                # Show the contract generation UI
+                st.header(f"Generated Draft: {st.session_state.agreement_type}")
+                st.subheader(f"Governing Law: {st.session_state.jurisdiction}")
+                st.markdown("---")
                 
-                pdf_title = f"{st.session_state.agreement_type} - Draft"
-                try:
-                    pdf_buffer = create_pdf_from_generated_text(
-                        generated_text, 
-                        pdf_title, 
-                        st.session_state.final_input_data
-                    )
+                generated_text = st.session_state.get('generated_text', None)
+                
+                if not generated_text:
+                    st.error("Document generation failed. No text was produced.")
+                elif isinstance(generated_text, str):
+                    # Generation succeeded, proceed to PDF creation
+                    st.success("Generation complete. Preparing PDF...")
                     
-                    if pdf_buffer:
-                        # Create a readable filename
-                        party_name_raw = st.session_state.final_input_data.get(
-                            'client_name',
-                            st.session_state.final_input_data.get(
-                                'employer_name',
+                    pdf_title = f"{st.session_state.agreement_type} - Draft"
+                    try:
+                        pdf_buffer = create_pdf_from_generated_text(
+                            generated_text, 
+                            pdf_title, 
+                            st.session_state.final_input_data
+                        )
+                        
+                        if pdf_buffer:
+                            # Create a readable filename
+                            party_name_raw = st.session_state.final_input_data.get(
+                                'client_name',
                                 st.session_state.final_input_data.get(
-                                    'landlord_name',
-                                    'Generated'
+                                    'employer_name',
+                                    st.session_state.final_input_data.get(
+                                        'landlord_name',
+                                        'Generated'
+                                    )
                                 )
                             )
-                        )
-                        
-                        party_name_clean = re.sub(r'[^\w\-]+', '_', str(party_name_raw))[:20]
-                        jurisdiction_clean = st.session_state.jurisdiction.replace(' ', '')
-                        agreement_clean = st.session_state.agreement_type.replace(' ', '_').replace('(', '').replace(')', '').replace('-', '')
-                        timestamp = datetime.now().strftime('%Y%m%d')
-                        
-                        file_name = f"{agreement_clean}_Draft_{party_name_clean}_{jurisdiction_clean}_{timestamp}.pdf"
-                        
-                        st.success("PDF Generated Successfully!")
-                        st.download_button(
-                            label="Download PDF Draft",
-                            data=pdf_buffer,
-                            file_name=file_name,
-                            mime="application/pdf"
-                        )
-                        
-                        st.subheader("Generated Text (for review):")
-                        st.text_area(
-                            "Review the text used for the PDF:",
-                            generated_text,
-                            height=300,
-                            key="generated_text_review",
-                            help="This is the raw text generated by the AI before PDF formatting."
-                        )
-                    else:
-                        st.error("PDF generation failed after text was created. See logs for details.")
-                        st.subheader("Raw Output (PDF Generation Failed):")
+                            
+                            party_name_clean = re.sub(r'[^\w\-]+', '_', str(party_name_raw))[:20]
+                            jurisdiction_clean = st.session_state.jurisdiction.replace(' ', '')
+                            agreement_clean = st.session_state.agreement_type.replace(' ', '_').replace('(', '').replace(')', '').replace('-', '')
+                            timestamp = datetime.now().strftime('%Y%m%d')
+                            
+                            file_name = f"{agreement_clean}_Draft_{party_name_clean}_{jurisdiction_clean}_{timestamp}.pdf"
+                            
+                            st.success("PDF Generated Successfully!")
+                            st.download_button(
+                                label="Download PDF Draft",
+                                data=pdf_buffer,
+                                file_name=file_name,
+                                mime="application/pdf"
+                            )
+                            
+                            st.subheader("Generated Text (for review):")
+                            st.text_area(
+                                "Review the text used for the PDF:",
+                                generated_text,
+                                height=300,
+                                key="generated_text_review",
+                                help="This is the raw text generated by the AI before PDF formatting."
+                            )
+                        else:
+                            st.error("PDF generation failed after text was created. See logs for details.")
+                            st.subheader("Raw Output (PDF Generation Failed):")
+                            st.text_area("You can copy the text below:", generated_text, height=400)
+                    except Exception as pdf_e:
+                        st.error(f"An unexpected error occurred during PDF creation: {pdf_e}")
+                        logger.error(f"PDF creation raised exception: {pdf_e}", exc_info=True)
+                        st.subheader("Raw Output (PDF Creation Error):")
                         st.text_area("You can copy the text below:", generated_text, height=400)
-                except Exception as pdf_e:
-                    st.error(f"An unexpected error occurred during PDF creation: {pdf_e}")
-                    logger.error(f"PDF creation raised exception: {pdf_e}", exc_info=True)
-                    st.subheader("Raw Output (PDF Creation Error):")
-                    st.text_area("You can copy the text below:", generated_text, height=400)
-            else:
-                # Handle cases where generate_contract returned unexpected type
-                st.warning("Generation produced unexpected output format.")
-                st.text_area("Raw Output:", str(generated_text), height=300)
+                else:
+                    # Handle cases where generate_contract returned unexpected type
+                    st.warning("Generation produced unexpected output format.")
+                    st.text_area("Raw Output:", str(generated_text), height=300)
+                    
+            else:  # Analysis tab
+                # Show the contract analysis UI
+                st.header(f"Contract Analysis: {st.session_state.agreement_type}")
+                st.subheader(f"Governing Law: {st.session_state.jurisdiction}")
+                st.markdown("---")
                 
-            # Button to reset the process
-            if st.button("Start New Document"):
+                # Import the contract_analysis module if not already imported
+                from contract_analysis import render_contract_analysis_tab
+                
+                # Call the analysis UI component
+                render_contract_analysis_tab(
+                    st.session_state.generated_text, 
+                    st.session_state.agreement_type,
+                    st.session_state.jurisdiction
+                )
+            
+            if st.button("Start New Document", key="start_new_doc_btn"):
                 # Clear relevant session state variables
                 st.session_state.app_stage = 'input'
                 st.session_state.initial_input_data = {}
                 st.session_state.review_data = {}
                 st.session_state.final_input_data = {}
                 st.session_state.generated_text = None
+                if "analysis_results" in st.session_state:
+                    del st.session_state.analysis_results
                 st.rerun()
-    
+        
     # Footer
     st.sidebar.divider()
     st.sidebar.markdown("""
-    **QwikContractAI**
+    **QuickContractAI**
     
-    Generate contract drafts with AI assistance:
+    Generate and analyze contract drafts with AI assistance:
     - Service Agreements
     - Employment Agreements
     - Residential Leases
