@@ -10,6 +10,8 @@ import time
 import json
 from typing import List, Dict, Any, Optional, Tuple
 import difflib
+from cuad_few_shots import get_few_shots
+from privacy import redact_inputs, restore_pii, describe_redaction
 
 
 # LangChain imports
@@ -271,7 +273,7 @@ def get_refiner_model():
 def get_validation_model():
     """Get the ShieldGemma model for validation"""
     return Ollama(
-        model="shieldgemma",
+        model="qwen2.5-coder:14b",
         callbacks=[StreamingStdOutCallbackHandler()],
         temperature=0.1,
     )
@@ -279,7 +281,7 @@ def get_validation_model():
 def get_consistency_model():
     """Get the Phi4 model for consistency validation"""
     return Ollama(
-        model="phi4",
+        model="deepseek-r1:14b",
         callbacks=[StreamingStdOutCallbackHandler()],
         temperature=0.1,
     )
@@ -401,22 +403,34 @@ def create_draft_generation_chain():
     llm = get_draft_model()
     
     template = """
-    You are a professional legal document drafting assistant. Create a complete and balanced {contract_type} based on the following details. 
+    You are a professional legal document drafting assistant. Create a complete and balanced {contract_type} based on the following details.
     The document should be thorough yet concise, with appropriate legal language and formatting.
-    
+
     Contract Type: {contract_type}
     Jurisdiction: {jurisdiction}
-    
+
+    The User Inputs below have been redacted on-device: real party names appear
+    as [PARTY_N], addresses as [ADDRESS_N], and monetary figures as [AMOUNT_N].
+    Treat each token as an opaque identifier and reuse it consistently
+    wherever the corresponding party / address / amount would naturally be
+    referenced.  The originals will be substituted back in by the calling
+    application after generation - do not attempt to guess them.
+
     User Inputs:
     {user_inputs}
-    
+
+    {cuad_examples}
+
     {precedent_extracts}
-    
+
+    IMPORTANT: Use only standard ASCII characters in your output. Do not use any fancy quotes (like " or "), em-dashes, en-dashes, or other Unicode characters. Use standard straight quotes ("), hyphens (-), and other ASCII equivalents.
+
     Format the document with:
     1. Clear section numbering (e.g., "SECTION 1. DEFINITIONS")
     2. Subsections with decimal numbering (e.g., "1.1. Term")
     3. Appropriate indentation for lists and clauses
     4. Standard legal formatting conventions
+    5. Consistent capitalization of defined terms throughout the document
     
     Include these standard sections (as appropriate for this contract type):
     - Parties and Recitals
@@ -431,11 +445,20 @@ def create_draft_generation_chain():
     - Governing Law and Dispute Resolution
     - General Provisions (including Notice, Assignment, Severability, Entire Agreement)
     
+    Additionally, incorporate these contract-specific considerations using only the provided inputs:
+    - For Service Agreements: Expand on Description of Services to include deliverables and quality standards. Use the Intellectual Property Rights field to create comprehensive IP provisions.
+    - For Employment Agreements: Elaborate on Duties and Responsibilities to include work expectations. Use the Non-Compete and Confidentiality Terms to create robust protection clauses.
+    - For Residential Lease Agreements: Use the Property Description, Utilities Responsibility, Pets Policy, and Smoking Policy to create detailed property use and maintenance sections.
+    
+    Ensure compliance with specific legal requirements for {jurisdiction}, incorporating any mandatory state-specific clauses or disclosures.
+    
+    Cross-reference related clauses appropriately when needed (e.g., "as defined in Section X above").
+    
     STOP before creating any signature block.
     """
     
     prompt = PromptTemplate(
-        input_variables=["contract_type", "jurisdiction", "user_inputs", "precedent_extracts"],
+        input_variables=["contract_type", "jurisdiction", "user_inputs", "cuad_examples", "precedent_extracts"],
         template=template,
     )
     
@@ -469,6 +492,12 @@ def create_clause_refinement_chain():
 
 # --- PDF Generation Class ---
 class ContractPDF(FPDF):
+    def preprocess_markdown_for_pdf(text):
+        """Strip markdown syntax from text before PDF generation"""
+        text = re.sub(r'\*\*(.*?)\*\*', r'\1', text)
+        text = re.sub(r'\*(.*?)\*', r'\1', text)
+        return text
+        
     def header(self):
         self.set_font('helvetica', 'B', 10)
         doc_title = self.title if hasattr(self, 'title') else 'Generated Contract'
@@ -490,7 +519,8 @@ class ContractPDF(FPDF):
     def chapter_body(self, body_text):
         self.set_font('helvetica', '', 10)
         try:
-            encoded_text = body_text.encode('latin-1', 'replace').decode('latin-1')
+            sanitized_text = sanitize_text_for_pdf(body_text)
+            encoded_text = sanitized_text.encode('latin-1', 'replace').decode('latin-1')
             self.multi_cell(0, 5, encoded_text, border=0, align='L')
         except Exception as e:
             logger.warning(f"PDF encoding/rendering issue for text segment: {e}")
@@ -517,8 +547,39 @@ class ContractPDF(FPDF):
         draw_party_sig(safe_party1)
         draw_party_sig(safe_party2)
 
+def sanitize_text_for_pdf(text):
+    """Replace Unicode characters with ASCII equivalents"""
+    replacements = {
+        '\u2019': "'",  # Right single quotation mark
+        '\u2018': "'",  # Left single quotation mark
+        '\u201C': '"',  # Left double quotation mark
+        '\u201D': '"',  # Right double quotation mark
+        '\u2013': '-',  # En dash
+        '\u2014': '--', # Em dash
+        '\u2026': '...', # Ellipsis
+        '\u00A0': ' ',  # Non-breaking space
+        '\u00B7': '*',  # Middle dot
+        '\u2022': '*',  # Bullet
+        '\u2039': '<',  # Single left-pointing angle quotation
+        '\u203A': '>',  # Single right-pointing angle quotation
+        '\u00AB': '<<', # Left double angle quotes
+        '\u00BB': '>>', # Right double angle quotes
+        '\u00A9': '(c)', # Copyright sign
+        '\u00AE': '(R)', # Registered sign
+        '\u2122': 'TM',  # Trademark sign
+    }
+    
+    for unicode_char, ascii_char in replacements.items():
+        text = text.replace(unicode_char, ascii_char)
+    
+    # Also catch any other non-Latin-1 characters
+    return ''.join(c if ord(c) < 256 else '_' for c in text)
+
 def create_pdf_from_generated_text(generated_text, title, input_data):
     """Creates a PDF document in memory from the generated text."""
+    # Sanitize the entire text first
+    generated_text = sanitize_text_for_pdf(generated_text)
+    
     pdf = ContractPDF(orientation='P', unit='mm', format='A4')
     pdf.set_title(title)
     pdf.set_author(APP_NAME)
@@ -528,15 +589,14 @@ def create_pdf_from_generated_text(generated_text, title, input_data):
     pdf.alias_nb_pages()
     pdf.set_font('helvetica', '', 10)
     
-    # Determine party names for signature block
     party1_keys = ['company_name', 'party1_name', 'client_name', 'employer_name', 'landlord_name']
     party2_keys = ['distributor_name', 'party2_name', 'contractor_name', 'employee_name', 'tenant_name']
     
     party1_raw = input_data.get(next((k for k in party1_keys if k in input_data and input_data.get(k)), None), "Party 1")
     party2_raw = input_data.get(next((k for k in party2_keys if k in input_data and input_data.get(k)), None), "Party 2")
     
-    party1 = str(party1_raw) if party1_raw else "Party 1"
-    party2 = str(party2_raw) if party2_raw else "Party 2"
+    party1 = sanitize_text_for_pdf(str(party1_raw) if party1_raw else "Party 1")
+    party2 = sanitize_text_for_pdf(str(party2_raw) if party2_raw else "Party 2")
 
     lines = generated_text.split('\n')
     for line in lines:
@@ -941,6 +1001,27 @@ def get_precedent_extracts(input_data, contract_type, jurisdiction):
         logger.error(f"Error retrieving precedents: {e}", exc_info=True)
         return "No precedent extracts available due to an error."
 
+def extract_json_from_text(text):
+    """Extract JSON array from text containing markdown code blocks or thinking tags"""
+    # First remove any <think>...</think> blocks
+    text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
+    
+    # Look for JSON inside markdown code blocks
+    json_pattern = r"```(?:json)?\s*([\[\{].*?[\]\}])\s*```"
+    json_match = re.search(json_pattern, text, re.DOTALL)
+    
+    if json_match:
+        return json_match.group(1).strip()
+    
+    # Alternative: look for any array or object notation
+    array_pattern = r"\[\s*\]|\[\s*\{.*?\}\s*\]"
+    array_match = re.search(array_pattern, text, re.DOTALL)
+    
+    if array_match:
+        return array_match.group(0).strip()
+           
+    return text  # Return original if extraction fails
+
 def validate_draft(draft_text, contract_type, user_inputs):
     """Validate the generated draft for placeholders and consistency"""
     issues = []
@@ -959,15 +1040,16 @@ def validate_draft(draft_text, contract_type, user_inputs):
         placeholder_result = placeholder_chain.run(contract_text=draft_text)
         
         try:
+            # First try direct JSON parsing
             placeholder_issues = json.loads(placeholder_result)
-            issues.extend(placeholder_issues)
         except json.JSONDecodeError:
-            logger.error(f"Invalid JSON from placeholder detection: {placeholder_result}")
-            issues.append({
-                "type": "error",
-                "field": "Validation",
-                "message": "Failed to parse placeholder detection results"
-            })
+            # If that fails, try to extract JSON from text
+            json_text = extract_json_from_text(placeholder_result)
+            try:
+                placeholder_issues = json.loads(json_text)
+            except json.JSONDecodeError:
+                logger.error(f"Invalid JSON from placeholder detection: {placeholder_result[:100]}...")
+                placeholder_issues = []  # Use empty array as fallback
             
         # Consistency validation
         consistency_chain = create_consistency_validation_chain()
@@ -1008,45 +1090,77 @@ def refine_clause_with_issue(issue, draft_text, contract_type, user_inputs):
             else:
                 serializable_inputs[key] = value
                 
-        # Extract the clause with the issue
+        # Extract common issue fields
         issue_field = issue.get("field", "")
-        issue_text = issue.get("text", "")
         issue_message = issue.get("message", "")
+        issue_type = issue.get("type", "")
+        issue_text = issue.get("text", "")
         
-        # Find the relevant section in the draft
-        section_pattern = re.compile(r"(SECTION|Section|ARTICLE)\s+[\d\.]+\s*[:\.]\s*" + re.escape(issue_field), re.IGNORECASE)
-        section_match = section_pattern.search(draft_text)
+        # Initialize variables
+        original_clause = None
+        section_match = None
         
-        if not section_match:
-            # Try to find by just the field name
-            field_pattern = re.compile(r"(\n|^)([^\n]*" + re.escape(issue_field) + "[^\n]*\n)", re.IGNORECASE)
-            field_match = field_pattern.search(draft_text)
+        # Special handling for placeholder issues
+        if issue_type == "placeholder" and issue_text:
+            # Create a more focused pattern to find this exact placeholder
+            placeholder_pattern = re.escape(issue_text)
+            field_pattern = re.escape(issue_field) if issue_field else r"SECTION\s+\d+(\.\d+)*"
             
-            if not field_match:
+            # Try to find the section containing the placeholder
+            try:
+                section_pattern = re.compile(f"(({field_pattern}[^\n]*)\n.*?{placeholder_pattern}.*?(?:\n\n|\Z))", 
+                                           re.DOTALL | re.IGNORECASE)
+                section_match = section_pattern.search(draft_text)
+                
+                if section_match:
+                    original_clause = section_match.group(1)
+                    logger.info(f"Found placeholder '{issue_text}' in section '{issue_field}'")
+            except Exception as e:
+                logger.error(f"Error in placeholder pattern matching: {e}")
+                # Continue with general section finding
+        
+        # If we haven't found the section yet, try general section finding approaches
+        if not original_clause:
+            # Try to find by section heading
+            if issue_field:
+                section_pattern = re.compile(r"((?:SECTION|Section|ARTICLE)\s+[\d\.]+\s*[:\.]\s*" + 
+                                           re.escape(issue_field) + r".*?(?=(?:SECTION|Section|ARTICLE)\s+[\d\.]+|\Z))", 
+                                           re.DOTALL | re.IGNORECASE)
+                section_match = section_pattern.search(draft_text)
+                
+                if section_match:
+                    original_clause = section_match.group(1)
+                    logger.info(f"Found section by heading: '{issue_field}'")
+            
+            # If still not found, try to find by the field name anywhere in the text
+            if not original_clause and issue_field:
+                field_pattern = re.compile(r"(\n|^)([^\n]*" + re.escape(issue_field) + r"[^\n]*\n[^\n]*)", 
+                                         re.IGNORECASE)
+                field_match = field_pattern.search(draft_text)
+                
+                if field_match:
+                    # Extract a reasonable chunk around the match
+                    start_pos = max(0, field_match.start() - 200)
+                    end_pos = min(len(draft_text), field_match.end() + 500)
+                    original_clause = draft_text[start_pos:end_pos]
+                    logger.info(f"Found section by content search: '{issue_field}'")
+            
+            # If we still couldn't find the section, log warning and return None
+            if not original_clause:
                 logger.warning(f"Could not locate section for issue: {issue}")
                 return None
-            
-            # Extract a reasonable chunk around the match
-            start_pos = max(0, field_match.start() - 200)
-            end_pos = min(len(draft_text), field_match.end() + 500)
-            original_clause = draft_text[start_pos:end_pos]
-        else:
-            # Find the end of the section (the next section heading)
-            section_start = section_match.start()
-            next_section_match = re.search(r"(\n|^)(SECTION|Section|ARTICLE)\s+[\d\.]+\s*[:\.]", draft_text[section_match.end():], re.IGNORECASE)
-            
-            if next_section_match:
-                section_end = section_match.end() + next_section_match.start()
-            else:
-                section_end = min(section_match.end() + 1000, len(draft_text))
-                
-            original_clause = draft_text[section_start:section_end]
         
         # Run the refinement chain
         refinement_chain = create_clause_refinement_chain()
+        
+        # Enhance the issue description for better context
+        issue_description = f"{issue_field}: {issue_message}"
+        if issue_type == "placeholder":
+            issue_description = f"Replace placeholder '{issue_text}' in {issue_field}"
+        
         result = refinement_chain.run(
             contract_type=contract_type,
-            issue_description=f"{issue_field}: {issue_message}",
+            issue_description=issue_description,
             original_clause=original_clause,
             user_inputs=json.dumps(serializable_inputs)
         )
@@ -1104,20 +1218,25 @@ def regenerate_draft_with_fixes(draft_text, fixes, contract_type, jurisdiction, 
             Make sure these issues are properly addressed in your new draft.
             """
             
-            # Combine user inputs with the modified prompt
+            # Combine user inputs with the modified prompt, then redact before
+            # the cloud call so the regeneration path honors the same privacy
+            # invariant as the initial draft.
             user_inputs_dict = serializable_inputs.copy()
             user_inputs_dict["_special_instructions"] = modified_prompt
-            
+            redacted_inputs, token_map = redact_inputs(user_inputs_dict, contract_type)
+            cuad_examples = get_few_shots(contract_type)
+
             # Regenerate
             result = draft_chain.run(
                 contract_type=contract_type,
                 jurisdiction=jurisdiction,
-                user_inputs=json.dumps(user_inputs_dict),
+                user_inputs=json.dumps(redacted_inputs),
+                cuad_examples=cuad_examples,
                 precedent_extracts=precedent_extracts
             )
-            
+
             if result and len(result) > 100:
-                return result
+                return restore_pii(result, token_map)
                 
         # If regeneration failed or we made only minor changes, return the updated text
         return updated_text
@@ -1146,18 +1265,35 @@ def generate_contract(contract_type, jurisdiction, input_data):
             else:
                 serializable_input[key] = value
         
-        # 3. Run the draft generation chain
+        # Privacy step: redact party identities + financial terms before the
+        # cloud call.  Only the redacted dict crosses the process boundary to
+        # Gemini; the token_map stays on-device and is used to restore the
+        # originals before any further use of the draft.
+        redacted_input, token_map = redact_inputs(serializable_input, contract_type)
+        logger.info(describe_redaction(token_map))
+
+        # Few-shot priors derived from the Contract Understanding Atticus
+        # Dataset (CUAD).  Empty string is fine when no exemplars exist for
+        # this contract type - the prompt degrades cleanly.
+        cuad_examples = get_few_shots(contract_type)
+
+        # 3. Run the draft generation chain (with redacted inputs only)
         initial_draft = draft_chain.run(
             contract_type=contract_type,
             jurisdiction=jurisdiction,
-            user_inputs=json.dumps(serializable_input),
+            user_inputs=json.dumps(redacted_input),
+            cuad_examples=cuad_examples,
             precedent_extracts=precedent_extracts
         )
-        
+
         if not initial_draft or len(initial_draft) < 100:
             st.error("Draft generation failed to produce a valid document")
             return None
-            
+
+        # Restore party identities + financial terms on-device.  Everything
+        # downstream (local validation, PDF export) operates on the real text.
+        initial_draft = restore_pii(initial_draft, token_map)
+
         # 4. Validate the draft
         st.info("Validating draft for consistency and completeness...")
         issues = validate_draft(initial_draft, contract_type, serializable_input)
@@ -1176,6 +1312,11 @@ def generate_contract(contract_type, jurisdiction, input_data):
                 # Refine clauses with issues
                 fixes = []
                 for issue in issues:
+                    # Skip generic validation errors that don't point to specific sections
+                    if issue.get("type") == "error" and issue.get("field") == "Validation":
+                        logger.info(f"Skipping generic validation error: {issue.get('message')}")
+                        continue
+                        
                     fix = refine_clause_with_issue(issue, initial_draft, contract_type, serializable_input)
                     if fix:
                         fixes.append(fix)
