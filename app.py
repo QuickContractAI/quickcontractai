@@ -10,8 +10,10 @@ import time
 import json
 from typing import List, Dict, Any, Optional, Tuple
 import difflib
+from contract_analysis import render_contract_analysis_tab
 from cuad_few_shots import get_few_shots
 from privacy import redact_inputs, restore_pii, describe_redaction
+
 
 
 # LangChain imports
@@ -271,7 +273,7 @@ def get_refiner_model():
     )
 
 def get_validation_model():
-    """Get the ShieldGemma model for validation"""
+    """Get the Qwen model for validation"""
     return Ollama(
         model="qwen2.5-coder:14b",
         callbacks=[StreamingStdOutCallbackHandler()],
@@ -279,7 +281,7 @@ def get_validation_model():
     )
 
 def get_consistency_model():
-    """Get the Phi4 model for consistency validation"""
+    """Get the Deepseek model for consistency validation"""
     return Ollama(
         model="deepseek-r1:14b",
         callbacks=[StreamingStdOutCallbackHandler()],
@@ -490,14 +492,72 @@ def create_clause_refinement_chain():
     
     return LLMChain(llm=llm, prompt=prompt, output_key="refined_clause")
 
+def preprocess_markdown_for_pdf(text):
+    """
+    Strip markdown syntax from text before PDF generation while 
+    preserving formatting intent where possible
+    """
+    # Headers - remove # symbols
+    text = re.sub(r'^#{1,6}\s+(.+)$', r'\1', text, flags=re.MULTILINE)
+    
+    # Bold - remove ** or __ markers
+    text = re.sub(r'\*\*(.*?)\*\*', r'\1', text)
+    text = re.sub(r'__(.*?)__', r'\1', text)
+    
+    # Italic - remove * or _ markers
+    text = re.sub(r'\*(.*?)\*', r'\1', text)
+    text = re.sub(r'_(.*?)_', r'\1', text)
+    
+    # Strikethrough - remove ~~ markers
+    text = re.sub(r'~~(.*?)~~', r'\1', text)
+    
+    # Code blocks - both inline and fenced
+    text = re.sub(r'```(?:\w+)?\n(.*?)\n```', r'\1', text, flags=re.DOTALL)
+    text = re.sub(r'`(.*?)`', r'\1', text)
+    
+    # Blockquotes - remove > symbols 
+    text = re.sub(r'^>\s+(.+)$', r'\1', text, flags=re.MULTILINE)
+    
+    # Horizontal rules - replace with extra newlines
+    text = re.sub(r'^\s*[-*_]{3,}\s*$', '\n\n', text, flags=re.MULTILINE)
+    
+    # Lists - preserve the text but remove markers
+    # Ordered lists
+    text = re.sub(r'^\s*\d+\.\s+(.+)$', r'\1', text, flags=re.MULTILINE)
+    # Unordered lists with *, +, or -
+    text = re.sub(r'^\s*[-*+]\s+(.+)$', r'\1', text, flags=re.MULTILINE)
+    
+    # Links - extract just the link text, not the URL
+    text = re.sub(r'\[(.*?)\]\(.*?\)', r'\1', text)
+    
+    # Images - replace with just the alt text
+    text = re.sub(r'!\[(.*?)\]\(.*?\)', r'[Image: \1]', text)
+    
+    # Tables - this is more complex, but we can try to preserve the content
+    # This simple approach just removes the table formatting
+    text = re.sub(r'\|', ' ', text)  # Replace pipe separators with spaces
+    text = re.sub(r'^\s*[-:]+\s*$', '', text, flags=re.MULTILINE)  # Remove table header separator row
+    
+    # Task lists - convert to plain text
+    text = re.sub(r'^\s*- \[ \]\s+(.+)$', r'☐ \1', text, flags=re.MULTILINE)  # Unchecked
+    text = re.sub(r'^\s*- \[x\]\s+(.+)$', r'☑ \1', text, flags=re.MULTILINE)  # Checked
+    
+    # Footnotes - simplify by removing the reference notation
+    text = re.sub(r'\[\^(\d+)\](?!:)', '', text)  # Remove reference markers
+    text = re.sub(r'^\[\^(\d+)\]:\s*(.*?)$', r'\2', text, flags=re.MULTILINE)  # Convert footnotes to regular text
+    
+    # Remove any HTML tags that might be in the markdown
+    text = re.sub(r'<([^>]+)>', '', text)
+    
+    # Clean up excessive whitespace
+    text = re.sub(r'\n{3,}', '\n\n', text)  # Replace multiple newlines with just two
+    text = re.sub(r'  +', ' ', text)  # Replace multiple spaces with a single space
+    
+    return text
+
 # --- PDF Generation Class ---
 class ContractPDF(FPDF):
-    def preprocess_markdown_for_pdf(text):
-        """Strip markdown syntax from text before PDF generation"""
-        text = re.sub(r'\*\*(.*?)\*\*', r'\1', text)
-        text = re.sub(r'\*(.*?)\*', r'\1', text)
-        return text
-        
+    
     def header(self):
         self.set_font('helvetica', 'B', 10)
         doc_title = self.title if hasattr(self, 'title') else 'Generated Contract'
@@ -576,10 +636,37 @@ def sanitize_text_for_pdf(text):
     return ''.join(c if ord(c) < 256 else '_' for c in text)
 
 def create_pdf_from_generated_text(generated_text, title, input_data):
-    """Creates a PDF document in memory from the generated text."""
-    # Sanitize the entire text first
-    generated_text = sanitize_text_for_pdf(generated_text)
+    """Creates a PDF document in memory from the generated text with better formatting."""
+    # First, apply preprocessing to remove markdown syntax
+    original_text = generated_text
+    generated_text = preprocess_markdown_for_pdf(generated_text)
+    generated_text = sanitize_text_for_pdf(generated_text)    
+
+    # Detect section headers from the original markdown
+    header_patterns = {
+        'h1': re.compile(r'^# (.+)$', re.MULTILINE),
+        'h2': re.compile(r'^## (.+)$', re.MULTILINE),
+        'h3': re.compile(r'^### (.+)$', re.MULTILINE),
+        'bold': re.compile(r'\*\*(.*?)\*\*'),
+        'strong_heading': re.compile(r'^(.*?):\s*$', re.MULTILINE)
+    }
     
+    # Find headers in original text to preserve formatting intent
+    headers = {}
+    for level, pattern in header_patterns.items():
+        for match in pattern.finditer(original_text):
+            if level in ['h1', 'h2', 'h3']:
+                header_text = match.group(1)
+                headers[header_text] = level
+            elif level == 'bold':
+                bold_text = match.group(1)
+                headers[bold_text] = 'bold'
+            elif level == 'strong_heading':
+                heading_text = match.group(1)
+                if heading_text.isupper() or len(heading_text.split()) <= 5:
+                    headers[heading_text] = 'strong_heading'
+
+    # Create PDF
     pdf = ContractPDF(orientation='P', unit='mm', format='A4')
     pdf.set_title(title)
     pdf.set_author(APP_NAME)
@@ -589,6 +676,7 @@ def create_pdf_from_generated_text(generated_text, title, input_data):
     pdf.alias_nb_pages()
     pdf.set_font('helvetica', '', 10)
     
+    # Get party names for signature block
     party1_keys = ['company_name', 'party1_name', 'client_name', 'employer_name', 'landlord_name']
     party2_keys = ['distributor_name', 'party2_name', 'contractor_name', 'employee_name', 'tenant_name']
     
@@ -597,12 +685,13 @@ def create_pdf_from_generated_text(generated_text, title, input_data):
     
     party1 = sanitize_text_for_pdf(str(party1_raw) if party1_raw else "Party 1")
     party2 = sanitize_text_for_pdf(str(party2_raw) if party2_raw else "Party 2")
-
+    
+    # Split the text into lines and process each line
     lines = generated_text.split('\n')
     for line in lines:
         line_stripped = line.strip()
         
-        # Skip signature-related lines that might be in the text
+        # Skip signature-related lines
         sig_keywords = ("in witness whereof", "agreed and accepted by:", "by:", "name:", "title:", 
                       "date:", "signature:", "party 1:", "party 2:", "landlord:", "tenant:", 
                       "company:", "distributor:", "client:", "contractor:", "employer:", "employee:")
@@ -620,15 +709,39 @@ def create_pdf_from_generated_text(generated_text, title, input_data):
             pdf.ln(3)
             continue
 
-        # PDF Formatting Logic
-        if line_stripped.startswith("**") and line_stripped.endswith("**") and len(line_stripped) > 4:
-            # Main Section Titles (like **ARTICLE X: TITLE**)
-            pdf.ln(4)
-            pdf.set_font('helvetica', 'B', 12)
-            pdf.chapter_title(line_stripped.strip('* '))
-            pdf.ln(2)
-        elif (line_stripped.startswith("ARTICLE ") or line_stripped.startswith("SECTION ") or 
-             line_stripped.startswith("Section ") or re.match(r"^[IVXLCDM]+\.\s+", line_stripped)) and ':' in line_stripped:
+        # Check if this line contains a header we previously detected
+        header_matched = False
+        for header_text, header_type in headers.items():
+            if header_text in line_stripped:
+                header_matched = True
+                if header_type == 'h1':
+                    pdf.ln(6)
+                    pdf.set_font('helvetica', 'B', 14)
+                    pdf.chapter_title(line_stripped)
+                    pdf.ln(4)
+                elif header_type == 'h2':
+                    pdf.ln(5)
+                    pdf.set_font('helvetica', 'B', 12)
+                    pdf.chapter_title(line_stripped)
+                    pdf.ln(3)
+                elif header_type == 'h3' or header_type == 'bold':
+                    pdf.ln(3)
+                    pdf.set_font('helvetica', 'B', 11)
+                    pdf.chapter_body(line_stripped)
+                    pdf.ln(2)
+                elif header_type == 'strong_heading':
+                    pdf.ln(2)
+                    pdf.set_font('helvetica', 'B', 10)
+                    pdf.chapter_body(line_stripped)
+                    pdf.ln(1)
+                break
+        
+        if header_matched:
+            continue
+            
+        # Standard formatting based on line characteristics
+        if (line_stripped.startswith("ARTICLE ") or line_stripped.startswith("SECTION ") or 
+            line_stripped.startswith("Section ") or re.match(r"^[IVXLCDM]+\.\s+", line_stripped)) and ':' in line_stripped:
             # Numbered Section Titles
             pdf.ln(4)
             pdf.set_font('helvetica', 'B', 11)
@@ -1352,7 +1465,7 @@ def generate_contract(contract_type, jurisdiction, input_data):
 # --- Streamlit App UI ---
 def main():
     st.title(APP_NAME)
-    st.caption("Generate legal agreement drafts with AI assistance. Review is essential.")
+    st.caption("Generate and analyze legal agreement drafts with AI assistance. Review is essential.")
     
     # Initialize session state
     if 'app_stage' not in st.session_state:
@@ -1373,9 +1486,20 @@ def main():
         st.session_state.jurisdiction = US_STATES[default_jurisdiction_index]
     if 'generated_text' not in st.session_state:
         st.session_state.generated_text = None
+    if 'active_tab' not in st.session_state:
+        st.session_state.active_tab = 'generate'
     
     # Sidebar selectors
     st.sidebar.header("Contract Options")
+    
+    # Only show Generate/Analyze tabs if we're in the final stage
+    if st.session_state.app_stage == 'done':
+        st.session_state.active_tab = st.sidebar.radio(
+            "Mode:",
+            options=['Generate', 'Analyze'],
+            index=0 if st.session_state.active_tab == 'generate' else 1,
+            key="mode_selector"
+        ).lower()
     
     agreement_type_options = list(AGREEMENT_QUESTIONS.keys())
     try:
@@ -1675,93 +1799,114 @@ def main():
                 st.session_state.app_stage = 'done'
                 st.rerun()
                 
+        # This replaces the existing code in the 'done' stage of your main() function
         if st.session_state.app_stage == 'done':
-            st.header(f"Generated Draft: {st.session_state.agreement_type}")
-            st.subheader(f"Governing Law: {st.session_state.jurisdiction}")
-            st.markdown("---")
-            
-            generated_text = st.session_state.get('generated_text', None)
-            
-            if not generated_text:
-                st.error("Document generation failed. No text was produced.")
-            elif isinstance(generated_text, str):
-                # Generation succeeded, proceed to PDF creation
-                st.success("Generation complete. Preparing PDF...")
+            # Check which tab is active
+            if st.session_state.active_tab == 'generate':
+                # Show the contract generation UI
+                st.header(f"Generated Draft: {st.session_state.agreement_type}")
+                st.subheader(f"Governing Law: {st.session_state.jurisdiction}")
+                st.markdown("---")
                 
-                pdf_title = f"{st.session_state.agreement_type} - Draft"
-                try:
-                    pdf_buffer = create_pdf_from_generated_text(
-                        generated_text, 
-                        pdf_title, 
-                        st.session_state.final_input_data
-                    )
+                generated_text = st.session_state.get('generated_text', None)
+                
+                if not generated_text:
+                    st.error("Document generation failed. No text was produced.")
+                elif isinstance(generated_text, str):
+                    # Generation succeeded, proceed to PDF creation
+                    st.success("Generation complete. Preparing PDF...")
                     
-                    if pdf_buffer:
-                        # Create a readable filename
-                        party_name_raw = st.session_state.final_input_data.get(
-                            'client_name',
-                            st.session_state.final_input_data.get(
-                                'employer_name',
+                    pdf_title = f"{st.session_state.agreement_type} - Draft"
+                    try:
+                        pdf_buffer = create_pdf_from_generated_text(
+                            generated_text, 
+                            pdf_title, 
+                            st.session_state.final_input_data
+                        )
+                        
+                        if pdf_buffer:
+                            # Create a readable filename
+                            party_name_raw = st.session_state.final_input_data.get(
+                                'client_name',
                                 st.session_state.final_input_data.get(
-                                    'landlord_name',
-                                    'Generated'
+                                    'employer_name',
+                                    st.session_state.final_input_data.get(
+                                        'landlord_name',
+                                        'Generated'
+                                    )
                                 )
                             )
-                        )
-                        
-                        party_name_clean = re.sub(r'[^\w\-]+', '_', str(party_name_raw))[:20]
-                        jurisdiction_clean = st.session_state.jurisdiction.replace(' ', '')
-                        agreement_clean = st.session_state.agreement_type.replace(' ', '_').replace('(', '').replace(')', '').replace('-', '')
-                        timestamp = datetime.now().strftime('%Y%m%d')
-                        
-                        file_name = f"{agreement_clean}_Draft_{party_name_clean}_{jurisdiction_clean}_{timestamp}.pdf"
-                        
-                        st.success("PDF Generated Successfully!")
-                        st.download_button(
-                            label="Download PDF Draft",
-                            data=pdf_buffer,
-                            file_name=file_name,
-                            mime="application/pdf"
-                        )
-                        
-                        st.subheader("Generated Text (for review):")
-                        st.text_area(
-                            "Review the text used for the PDF:",
-                            generated_text,
-                            height=300,
-                            key="generated_text_review",
-                            help="This is the raw text generated by the AI before PDF formatting."
-                        )
-                    else:
-                        st.error("PDF generation failed after text was created. See logs for details.")
-                        st.subheader("Raw Output (PDF Generation Failed):")
+                            
+                            party_name_clean = re.sub(r'[^\w\-]+', '_', str(party_name_raw))[:20]
+                            jurisdiction_clean = st.session_state.jurisdiction.replace(' ', '')
+                            agreement_clean = st.session_state.agreement_type.replace(' ', '_').replace('(', '').replace(')', '').replace('-', '')
+                            timestamp = datetime.now().strftime('%Y%m%d')
+                            
+                            file_name = f"{agreement_clean}_Draft_{party_name_clean}_{jurisdiction_clean}_{timestamp}.pdf"
+                            
+                            st.success("PDF Generated Successfully!")
+                            st.download_button(
+                                label="Download PDF Draft",
+                                data=pdf_buffer,
+                                file_name=file_name,
+                                mime="application/pdf"
+                            )
+                            
+                            st.subheader("Generated Text (for review):")
+                            st.text_area(
+                                "Review the text used for the PDF:",
+                                generated_text,
+                                height=300,
+                                key="generated_text_review",
+                                help="This is the raw text generated by the AI before PDF formatting."
+                            )
+                        else:
+                            st.error("PDF generation failed after text was created. See logs for details.")
+                            st.subheader("Raw Output (PDF Generation Failed):")
+                            st.text_area("You can copy the text below:", generated_text, height=400)
+                    except Exception as pdf_e:
+                        st.error(f"An unexpected error occurred during PDF creation: {pdf_e}")
+                        logger.error(f"PDF creation raised exception: {pdf_e}", exc_info=True)
+                        st.subheader("Raw Output (PDF Creation Error):")
                         st.text_area("You can copy the text below:", generated_text, height=400)
-                except Exception as pdf_e:
-                    st.error(f"An unexpected error occurred during PDF creation: {pdf_e}")
-                    logger.error(f"PDF creation raised exception: {pdf_e}", exc_info=True)
-                    st.subheader("Raw Output (PDF Creation Error):")
-                    st.text_area("You can copy the text below:", generated_text, height=400)
-            else:
-                # Handle cases where generate_contract returned unexpected type
-                st.warning("Generation produced unexpected output format.")
-                st.text_area("Raw Output:", str(generated_text), height=300)
+                else:
+                    # Handle cases where generate_contract returned unexpected type
+                    st.warning("Generation produced unexpected output format.")
+                    st.text_area("Raw Output:", str(generated_text), height=300)
+                    
+            else:  # Analysis tab
+                # Show the contract analysis UI
+                st.header(f"Contract Analysis: {st.session_state.agreement_type}")
+                st.subheader(f"Governing Law: {st.session_state.jurisdiction}")
+                st.markdown("---")
                 
-            # Button to reset the process
-            if st.button("Start New Document"):
+                # Import the contract_analysis module if not already imported
+                from contract_analysis import render_contract_analysis_tab
+                
+                # Call the analysis UI component
+                render_contract_analysis_tab(
+                    st.session_state.generated_text, 
+                    st.session_state.agreement_type,
+                    st.session_state.jurisdiction
+                )
+            
+            if st.button("Start New Document", key="start_new_doc_btn"):
                 # Clear relevant session state variables
                 st.session_state.app_stage = 'input'
                 st.session_state.initial_input_data = {}
                 st.session_state.review_data = {}
                 st.session_state.final_input_data = {}
                 st.session_state.generated_text = None
+                if "analysis_results" in st.session_state:
+                    del st.session_state.analysis_results
                 st.rerun()
-    
+        
     # Footer
     st.sidebar.divider()
     st.sidebar.markdown("""
-    **QwikContractAI**
+    **QuickContractAI**
     
-    Generate contract drafts with AI assistance:
+    Generate and analyze contract drafts with AI assistance:
     - Service Agreements
     - Employment Agreements
     - Residential Leases
