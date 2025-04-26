@@ -490,14 +490,72 @@ def create_clause_refinement_chain():
     
     return LLMChain(llm=llm, prompt=prompt, output_key="refined_clause")
 
+def preprocess_markdown_for_pdf(text):
+    """
+    Strip markdown syntax from text before PDF generation while 
+    preserving formatting intent where possible
+    """
+    # Headers - remove # symbols
+    text = re.sub(r'^#{1,6}\s+(.+)$', r'\1', text, flags=re.MULTILINE)
+    
+    # Bold - remove ** or __ markers
+    text = re.sub(r'\*\*(.*?)\*\*', r'\1', text)
+    text = re.sub(r'__(.*?)__', r'\1', text)
+    
+    # Italic - remove * or _ markers
+    text = re.sub(r'\*(.*?)\*', r'\1', text)
+    text = re.sub(r'_(.*?)_', r'\1', text)
+    
+    # Strikethrough - remove ~~ markers
+    text = re.sub(r'~~(.*?)~~', r'\1', text)
+    
+    # Code blocks - both inline and fenced
+    text = re.sub(r'```(?:\w+)?\n(.*?)\n```', r'\1', text, flags=re.DOTALL)
+    text = re.sub(r'`(.*?)`', r'\1', text)
+    
+    # Blockquotes - remove > symbols 
+    text = re.sub(r'^>\s+(.+)$', r'\1', text, flags=re.MULTILINE)
+    
+    # Horizontal rules - replace with extra newlines
+    text = re.sub(r'^\s*[-*_]{3,}\s*$', '\n\n', text, flags=re.MULTILINE)
+    
+    # Lists - preserve the text but remove markers
+    # Ordered lists
+    text = re.sub(r'^\s*\d+\.\s+(.+)$', r'\1', text, flags=re.MULTILINE)
+    # Unordered lists with *, +, or -
+    text = re.sub(r'^\s*[-*+]\s+(.+)$', r'\1', text, flags=re.MULTILINE)
+    
+    # Links - extract just the link text, not the URL
+    text = re.sub(r'\[(.*?)\]\(.*?\)', r'\1', text)
+    
+    # Images - replace with just the alt text
+    text = re.sub(r'!\[(.*?)\]\(.*?\)', r'[Image: \1]', text)
+    
+    # Tables - this is more complex, but we can try to preserve the content
+    # This simple approach just removes the table formatting
+    text = re.sub(r'\|', ' ', text)  # Replace pipe separators with spaces
+    text = re.sub(r'^\s*[-:]+\s*$', '', text, flags=re.MULTILINE)  # Remove table header separator row
+    
+    # Task lists - convert to plain text
+    text = re.sub(r'^\s*- \[ \]\s+(.+)$', r'☐ \1', text, flags=re.MULTILINE)  # Unchecked
+    text = re.sub(r'^\s*- \[x\]\s+(.+)$', r'☑ \1', text, flags=re.MULTILINE)  # Checked
+    
+    # Footnotes - simplify by removing the reference notation
+    text = re.sub(r'\[\^(\d+)\](?!:)', '', text)  # Remove reference markers
+    text = re.sub(r'^\[\^(\d+)\]:\s*(.*?)$', r'\2', text, flags=re.MULTILINE)  # Convert footnotes to regular text
+    
+    # Remove any HTML tags that might be in the markdown
+    text = re.sub(r'<([^>]+)>', '', text)
+    
+    # Clean up excessive whitespace
+    text = re.sub(r'\n{3,}', '\n\n', text)  # Replace multiple newlines with just two
+    text = re.sub(r'  +', ' ', text)  # Replace multiple spaces with a single space
+    
+    return text
+
 # --- PDF Generation Class ---
 class ContractPDF(FPDF):
-    def preprocess_markdown_for_pdf(text):
-        """Strip markdown syntax from text before PDF generation"""
-        text = re.sub(r'\*\*(.*?)\*\*', r'\1', text)
-        text = re.sub(r'\*(.*?)\*', r'\1', text)
-        return text
-        
+    
     def header(self):
         self.set_font('helvetica', 'B', 10)
         doc_title = self.title if hasattr(self, 'title') else 'Generated Contract'
@@ -576,10 +634,37 @@ def sanitize_text_for_pdf(text):
     return ''.join(c if ord(c) < 256 else '_' for c in text)
 
 def create_pdf_from_generated_text(generated_text, title, input_data):
-    """Creates a PDF document in memory from the generated text."""
-    # Sanitize the entire text first
-    generated_text = sanitize_text_for_pdf(generated_text)
+    """Creates a PDF document in memory from the generated text with better formatting."""
+    # First, apply preprocessing to remove markdown syntax
+    original_text = generated_text
+    generated_text = preprocess_markdown_for_pdf(generated_text)
+    generated_text = sanitize_text_for_pdf(generated_text)    
+
+    # Detect section headers from the original markdown
+    header_patterns = {
+        'h1': re.compile(r'^# (.+)$', re.MULTILINE),
+        'h2': re.compile(r'^## (.+)$', re.MULTILINE),
+        'h3': re.compile(r'^### (.+)$', re.MULTILINE),
+        'bold': re.compile(r'\*\*(.*?)\*\*'),
+        'strong_heading': re.compile(r'^(.*?):\s*$', re.MULTILINE)
+    }
     
+    # Find headers in original text to preserve formatting intent
+    headers = {}
+    for level, pattern in header_patterns.items():
+        for match in pattern.finditer(original_text):
+            if level in ['h1', 'h2', 'h3']:
+                header_text = match.group(1)
+                headers[header_text] = level
+            elif level == 'bold':
+                bold_text = match.group(1)
+                headers[bold_text] = 'bold'
+            elif level == 'strong_heading':
+                heading_text = match.group(1)
+                if heading_text.isupper() or len(heading_text.split()) <= 5:
+                    headers[heading_text] = 'strong_heading'
+
+    # Create PDF
     pdf = ContractPDF(orientation='P', unit='mm', format='A4')
     pdf.set_title(title)
     pdf.set_author(APP_NAME)
@@ -589,6 +674,7 @@ def create_pdf_from_generated_text(generated_text, title, input_data):
     pdf.alias_nb_pages()
     pdf.set_font('helvetica', '', 10)
     
+    # Get party names for signature block
     party1_keys = ['company_name', 'party1_name', 'client_name', 'employer_name', 'landlord_name']
     party2_keys = ['distributor_name', 'party2_name', 'contractor_name', 'employee_name', 'tenant_name']
     
@@ -597,12 +683,13 @@ def create_pdf_from_generated_text(generated_text, title, input_data):
     
     party1 = sanitize_text_for_pdf(str(party1_raw) if party1_raw else "Party 1")
     party2 = sanitize_text_for_pdf(str(party2_raw) if party2_raw else "Party 2")
-
+    
+    # Split the text into lines and process each line
     lines = generated_text.split('\n')
     for line in lines:
         line_stripped = line.strip()
         
-        # Skip signature-related lines that might be in the text
+        # Skip signature-related lines
         sig_keywords = ("in witness whereof", "agreed and accepted by:", "by:", "name:", "title:", 
                       "date:", "signature:", "party 1:", "party 2:", "landlord:", "tenant:", 
                       "company:", "distributor:", "client:", "contractor:", "employer:", "employee:")
@@ -620,15 +707,39 @@ def create_pdf_from_generated_text(generated_text, title, input_data):
             pdf.ln(3)
             continue
 
-        # PDF Formatting Logic
-        if line_stripped.startswith("**") and line_stripped.endswith("**") and len(line_stripped) > 4:
-            # Main Section Titles (like **ARTICLE X: TITLE**)
-            pdf.ln(4)
-            pdf.set_font('helvetica', 'B', 12)
-            pdf.chapter_title(line_stripped.strip('* '))
-            pdf.ln(2)
-        elif (line_stripped.startswith("ARTICLE ") or line_stripped.startswith("SECTION ") or 
-             line_stripped.startswith("Section ") or re.match(r"^[IVXLCDM]+\.\s+", line_stripped)) and ':' in line_stripped:
+        # Check if this line contains a header we previously detected
+        header_matched = False
+        for header_text, header_type in headers.items():
+            if header_text in line_stripped:
+                header_matched = True
+                if header_type == 'h1':
+                    pdf.ln(6)
+                    pdf.set_font('helvetica', 'B', 14)
+                    pdf.chapter_title(line_stripped)
+                    pdf.ln(4)
+                elif header_type == 'h2':
+                    pdf.ln(5)
+                    pdf.set_font('helvetica', 'B', 12)
+                    pdf.chapter_title(line_stripped)
+                    pdf.ln(3)
+                elif header_type == 'h3' or header_type == 'bold':
+                    pdf.ln(3)
+                    pdf.set_font('helvetica', 'B', 11)
+                    pdf.chapter_body(line_stripped)
+                    pdf.ln(2)
+                elif header_type == 'strong_heading':
+                    pdf.ln(2)
+                    pdf.set_font('helvetica', 'B', 10)
+                    pdf.chapter_body(line_stripped)
+                    pdf.ln(1)
+                break
+        
+        if header_matched:
+            continue
+            
+        # Standard formatting based on line characteristics
+        if (line_stripped.startswith("ARTICLE ") or line_stripped.startswith("SECTION ") or 
+            line_stripped.startswith("Section ") or re.match(r"^[IVXLCDM]+\.\s+", line_stripped)) and ':' in line_stripped:
             # Numbered Section Titles
             pdf.ln(4)
             pdf.set_font('helvetica', 'B', 11)
