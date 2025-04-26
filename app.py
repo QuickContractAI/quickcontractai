@@ -555,6 +555,155 @@ def preprocess_markdown_for_pdf(text):
     
     return text
 
+def render_document_qa_tab():
+    """Render the document Q&A tab using Snowflake Cortex Search"""
+    st.header("Document Q&A")
+    st.markdown("Ask questions about contracts and legal documents in the database.")
+    
+    # Optional filters for better search context
+    col1, col2 = st.columns(2)
+    with col1:
+        contract_types = ["Any Type", "Service Agreement", "Employment Agreement", "Residential Lease Agreement", "Other Contract"]
+        filter_contract_type = st.selectbox(
+            "Filter by document type (optional):",
+            options=contract_types
+        )
+    
+    with col2:
+        jurisdictions = ["Any Jurisdiction"] + US_STATES
+        filter_jurisdiction = st.selectbox(
+            "Filter by jurisdiction (optional):",
+            options=jurisdictions
+        )
+    
+    # Initialize Snowflake retriever if not already initialized
+    if "snowflake_retriever" not in st.session_state:
+        with st.spinner("Connecting to database..."):
+            retriever = SnowflakeCortexRetriever()
+            st.session_state.snowflake_retriever = retriever
+            
+            if not retriever.session:
+                st.error("Failed to connect to the Snowflake database. Please check your connection settings.")
+                return
+    
+    # Initialize chat history if not exists
+    if "qa_chat_history" not in st.session_state:
+        st.session_state.qa_chat_history = []
+    
+    # Display chat history
+    for message in st.session_state.qa_chat_history:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+    
+    # User input
+    user_question = st.chat_input("Ask a question about contracts...")
+    
+    if user_question:
+        # Add user message to chat history
+        st.session_state.qa_chat_history.append({"role": "user", "content": user_question})
+        
+        # Display user message
+        with st.chat_message("user"):
+            st.markdown(user_question)
+        
+        # Generate assistant response
+        with st.chat_message("assistant"):
+            with st.spinner("Searching documents..."):
+                # Enhance the query with filters if provided
+                enhanced_query = user_question
+                if filter_contract_type != "Any Type":
+                    enhanced_query += f" {filter_contract_type}"
+                if filter_jurisdiction != "Any Jurisdiction":
+                    enhanced_query += f" {filter_jurisdiction}"
+                
+                response = generate_document_qa_response(enhanced_query)
+                st.markdown(response)
+                # Add assistant message to chat history
+                st.session_state.qa_chat_history.append({"role": "assistant", "content": response})
+    
+    # Reset button to clear the chat history
+    if st.session_state.qa_chat_history and st.button("Clear Chat History"):
+        st.session_state.qa_chat_history = []
+        st.rerun()
+
+def generate_document_qa_response(user_question):
+    """
+    Generate a response to a user question using Snowflake Cortex Search
+    for document retrieval and LLM for answer generation
+    """
+    try:
+        # Get the Snowflake retriever from session state
+        retriever = st.session_state.snowflake_retriever
+        
+        if not retriever or not retriever.session:
+            return "Sorry, there's an issue with the database connection. Please try again later."
+        
+        # Retrieve relevant documents using Snowflake Cortex Search
+        docs = retriever.get_relevant_documents(user_question, k=5)
+        
+        if not docs:
+            return "I couldn't find relevant information in our database to answer that question. Please try rephrasing or ask a different question about contracts or legal documents."
+        
+        # Format the context from retrieved documents
+        context_parts = []
+        for i, doc in enumerate(docs):
+            source = doc.metadata.get('source', 'Unknown Source')
+            doc_index = doc.metadata.get('doc_index', -1)
+            chunk_index = doc.metadata.get('chunk_index', -1)
+            
+            context_parts.append(f"Document {i+1} (Source: {source}, Doc: {doc_index}, Chunk: {chunk_index}):\n{doc.page_content}")
+        
+        context = "\n\n".join(context_parts)
+        
+        # Use the Gemini model for answer generation
+        llm = get_draft_model()  # Reuse the Gemini model from the main application
+        
+        if not llm:
+            return "Sorry, the language model is not available. Please check your API keys and try again."
+        
+        # Create a custom prompt for Q&A
+        template = """
+        You are a legal assistant analyzing contract documents to answer user questions.
+        
+        Use only the following context from the retrieved documents to answer the question.
+        If the context doesn't contain the information needed to answer the question, say so clearly.
+        Don't make up information that's not in the provided context.
+        When relevant, provide specific references to document sources.
+        
+        Context from documents:
+        {context}
+        
+        Question: {question}
+        
+        Answer:
+        """
+        
+        prompt = PromptTemplate(
+            input_variables=["context", "question"],
+            template=template,
+        )
+        
+        # Create and run the chain
+        chain = LLMChain(llm=llm, prompt=prompt)
+        response = chain.run(context=context, question=user_question)
+        
+        if not response:
+            return "I couldn't generate a response. Please try a different question."
+        
+        # Format the response with source citations
+        formatted_response = f"{response}\n\n"
+        
+        # Add source information
+        formatted_response += "\n**Sources:**\n"
+        for i, doc in enumerate(docs[:3]):  # Limit to first 3 sources
+            source = doc.metadata.get('source', 'Unknown Source')
+            formatted_response += f"- {source}\n"
+        
+        return formatted_response
+    except Exception as e:
+        logger.error(f"Error generating Q&A response: {e}", exc_info=True)
+        return f"Sorry, an error occurred while processing your question: {str(e)}"
+
 # --- PDF Generation Class ---
 class ContractPDF(FPDF):
     
@@ -1462,10 +1611,9 @@ def generate_contract(contract_type, jurisdiction, input_data):
         st.error(f"An error occurred during contract generation: {str(e)}")
         return None
 
-# --- Streamlit App UI ---
 def main():
     st.title(APP_NAME)
-    st.caption("Generate and analyze legal agreement drafts with AI assistance. Review is essential.")
+    st.caption("Generate, analyze, and query legal documents with AI assistance. Review is essential.")
     
     # Initialize session state
     if 'app_stage' not in st.session_state:
@@ -1489,321 +1637,306 @@ def main():
     if 'active_tab' not in st.session_state:
         st.session_state.active_tab = 'generate'
     
-    # Sidebar selectors
-    st.sidebar.header("Contract Options")
+    # Main navigation sidebar
+    st.sidebar.header("Navigation")
+    app_mode = st.sidebar.radio(
+        "Select Mode:",
+        options=[
+            "Contract Generation", 
+            "Document Analysis", 
+            "Document Q&A"
+        ],
+        index=0 if st.session_state.active_tab == 'generate' else 
+               1 if st.session_state.active_tab == 'document_analysis' else 2,
+        key="app_mode_selector"
+    )
     
-    # Only show Generate/Analyze tabs if we're in the final stage
-    if st.session_state.app_stage == 'done':
-        st.session_state.active_tab = st.sidebar.radio(
-            "Mode:",
-            options=['Generate', 'Analyze'],
-            index=0 if st.session_state.active_tab == 'generate' else 1,
-            key="mode_selector"
-        ).lower()
+    # Update active tab based on navigation
+    if app_mode == "Contract Generation":
+        st.session_state.active_tab = 'generate'
+    elif app_mode == "Document Analysis":
+        st.session_state.active_tab = 'document_analysis'
+    elif app_mode == "Document Q&A":
+        st.session_state.active_tab = 'document_qa'
     
-    agreement_type_options = list(AGREEMENT_QUESTIONS.keys())
-    try:
-        default_agreement_type_index = agreement_type_options.index(st.session_state.agreement_type)
-    except ValueError:
-        default_agreement_type_index = 0
+    # --------- CONTRACT GENERATION MODE ---------
+    if st.session_state.active_tab == 'generate':
+        # Show contract options in sidebar
+        st.sidebar.header("Contract Options")
         
-    try:
-        default_jurisdiction_index = US_STATES.index(st.session_state.jurisdiction)
-    except ValueError:
+        agreement_type_options = list(AGREEMENT_QUESTIONS.keys())
         try:
-            default_jurisdiction_index = US_STATES.index("Massachusetts")
+            default_agreement_type_index = agreement_type_options.index(st.session_state.agreement_type)
         except ValueError:
-            default_jurisdiction_index = 0
+            default_agreement_type_index = 0
             
-    st.session_state.agreement_type = st.sidebar.selectbox(
-        "Select Agreement Type:",
-        options=agreement_type_options,
-        index=default_agreement_type_index,
-        key="agreement_type_selector",
-        disabled=(st.session_state.app_stage != 'input')
-    )
-    
-    st.session_state.jurisdiction = st.sidebar.selectbox(
-        "Select Governing Law State:",
-        options=US_STATES,
-        index=default_jurisdiction_index,
-        key="jurisdiction_selector",
-        disabled=(st.session_state.app_stage != 'input')
-    )
-    
-    # Stage 1: Input Form
-    if st.session_state.app_stage == 'input':
-        st.header(f"Generate: {st.session_state.agreement_type}")
-        st.subheader(f"Governing Law: {st.session_state.jurisdiction}")
-        st.markdown("---")
+        try:
+            default_jurisdiction_index = US_STATES.index(st.session_state.jurisdiction)
+        except ValueError:
+            try:
+                default_jurisdiction_index = US_STATES.index("Massachusetts")
+            except ValueError:
+                default_jurisdiction_index = 0
+                
+        st.session_state.agreement_type = st.sidebar.selectbox(
+            "Select Agreement Type:",
+            options=agreement_type_options,
+            index=default_agreement_type_index,
+            key="agreement_type_selector",
+            disabled=(st.session_state.app_stage != 'input')
+        )
         
-        st.markdown("""
-        **Instructions:** Fill in the details below. Click 'Review Inputs' for refinement and review. 
-        *Use clear sentences.* Fill required fields. **Legal review is essential.**
-        """)
+        st.session_state.jurisdiction = st.sidebar.selectbox(
+            "Select Governing Law State:",
+            options=US_STATES,
+            index=default_jurisdiction_index,
+            key="jurisdiction_selector",
+            disabled=(st.session_state.app_stage != 'input')
+        )
         
-        current_input_data = {}
-        questions = AGREEMENT_QUESTIONS.get(st.session_state.agreement_type, [])
-        
-        if not questions:
-            st.error("Configuration missing.")
-        else:
-            col1, col2 = st.columns(2)
-            for i, q in enumerate(questions):
-                target_col = col1 if i % 2 == 0 else col2
-                with target_col:
-                    q_widget_key = f"input_{st.session_state.agreement_type}_{q['key']}"
-                    label = q["label"]
-                    help_text = q.get("help", None)
-                    
-                    # Use existing initial data if available
-                    current_default = st.session_state.initial_input_data.get(q['key'], q.get("default"))
-                    
-                    if q["type"] == "text":
-                        current_input_data[q["key"]] = st.text_input(
-                            label, 
-                            key=q_widget_key, 
-                            value=str(current_default or ""), 
-                            help=help_text
-                        )
-                    elif q["type"] == "text_area":
-                        current_input_data[q["key"]] = st.text_area(
-                            label, 
-                            key=q_widget_key, 
-                            value=str(current_default or ""), 
-                            height=q.get("height", 100), 
-                            help=help_text
-                        )
-                    elif q["type"] == "date_input":
-                        date_val = None
-                        if isinstance(current_default, date):
-                            date_val = current_default
-                        elif isinstance(current_default, str):
-                            try:
-                                date_val = datetime.strptime(current_default, '%Y-%m-%d').date()
-                            except (ValueError, TypeError):
-                                date_val = None
-                        
-                        current_input_data[q["key"]] = st.date_input(
-                            label, 
-                            key=q_widget_key, 
-                            value=date_val, 
-                            help=help_text
-                        )
-            
+        # Contract generation workflow stages
+        if st.session_state.app_stage == 'input':
+            # Stage 1: Input Form
+            st.header(f"Generate: {st.session_state.agreement_type}")
+            st.subheader(f"Governing Law: {st.session_state.jurisdiction}")
             st.markdown("---")
-            if st.button("Review Inputs", type="primary"):
-                validation_errors = []
-                
-                # Check required fields
-                missing_fields = []
-                for q in questions:
-                    if q.get('required', False):
-                        value = current_input_data.get(q['key'])
-                        if value is None or (isinstance(value, str) and not value.strip()):
-                            missing_fields.append(q['label'])
-                
-                if missing_fields:
-                    validation_errors.append(f"Please fill in the required fields: {', '.join(missing_fields)}")
-                
-                # Date validation
-                start_date_key, end_date_key = None, None
-                agreement_type = st.session_state.agreement_type
-                q_list = AGREEMENT_QUESTIONS.get(agreement_type, [])
-                
-                start_q = next((q for q in q_list if q['key'] == 'start_date' and q['type'] == 'date_input'), None)
-                end_q = next((q for q in q_list if q['key'] == 'end_date' and q['type'] == 'date_input'), None)
-                
-                if start_q and end_q:
-                    start_date_val = current_input_data.get('start_date')
-                    end_date_val = current_input_data.get('end_date')
-                    
-                    if isinstance(start_date_val, date) and isinstance(end_date_val, date):
-                        if end_date_val < start_date_val:
-                            validation_errors.append(f"'{end_q['label']}' cannot be before '{start_q['label']}'.")
-                
-                if validation_errors:
-                    for error in validation_errors:
-                        st.error(error)
-                else:
-                    # Store current inputs before refinement
-                    st.session_state.initial_input_data = current_input_data.copy()
-                    st.session_state.review_data = {}
-                    st.session_state.final_input_data = {}
-                    
-                    # In the review stage, when processing inputs
-                    with st.spinner("Analyzing inputs for refinement..."):
-                        questions_for_type = AGREEMENT_QUESTIONS.get(st.session_state.agreement_type, [])
-
-                        # Process refinable fields
-                        for q in questions_for_type:
-                            field_key = q['key']
-                            original_value = st.session_state.initial_input_data.get(field_key)
+            
+            st.markdown("""
+            **Instructions:** Fill in the details below. Click 'Review Inputs' for refinement and review. 
+            *Use clear sentences.* Fill required fields. **Legal review is essential.**
+            """)
+            
+            current_input_data = {}
+            questions = AGREEMENT_QUESTIONS.get(st.session_state.agreement_type, [])
+            
+            if not questions:
+                st.error("Configuration missing.")
+            else:
+                col1, col2 = st.columns(2)
+                for i, q in enumerate(questions):
+                    target_col = col1 if i % 2 == 0 else col2
+                    with target_col:
+                        q_widget_key = f"input_{st.session_state.agreement_type}_{q['key']}"
+                        label = q["label"]
+                        help_text = q.get("help", None)
+                        
+                        # Use existing initial data if available
+                        current_default = st.session_state.initial_input_data.get(q['key'], q.get("default"))
+                        
+                        if q["type"] == "text":
+                            current_input_data[q["key"]] = st.text_input(
+                                label, 
+                                key=q_widget_key, 
+                                value=str(current_default or ""), 
+                                help=help_text
+                            )
+                        elif q["type"] == "text_area":
+                            current_input_data[q["key"]] = st.text_area(
+                                label, 
+                                key=q_widget_key, 
+                                value=str(current_default or ""), 
+                                height=q.get("height", 100), 
+                                help=help_text
+                            )
+                        elif q["type"] == "date_input":
+                            date_val = None
+                            if isinstance(current_default, date):
+                                date_val = current_default
+                            elif isinstance(current_default, str):
+                                try:
+                                    date_val = datetime.strptime(current_default, '%Y-%m-%d').date()
+                                except (ValueError, TypeError):
+                                    date_val = None
                             
-                            # Check if refinement is enabled for this field
-                            if q.get("refine", False) and isinstance(original_value, str) and original_value.strip():
-                                # Determine if this field should be skipped based on type
-                                should_skip = False
+                            current_input_data[q["key"]] = st.date_input(
+                                label, 
+                                key=q_widget_key, 
+                                value=date_val, 
+                                help=help_text
+                            )
+                
+                st.markdown("---")
+                if st.button("Review Inputs", type="primary"):
+                    validation_errors = []
+                    
+                    # Check required fields
+                    missing_fields = []
+                    for q in questions:
+                        if q.get('required', False):
+                            value = current_input_data.get(q['key'])
+                            if value is None or (isinstance(value, str) and not value.strip()):
+                                missing_fields.append(q['label'])
+                    
+                    if missing_fields:
+                        validation_errors.append(f"Please fill in the required fields: {', '.join(missing_fields)}")
+                    
+                    # Date validation
+                    start_date_key, end_date_key = None, None
+                    agreement_type = st.session_state.agreement_type
+                    q_list = AGREEMENT_QUESTIONS.get(agreement_type, [])
+                    
+                    start_q = next((q for q in q_list if q['key'] == 'start_date' and q['type'] == 'date_input'), None)
+                    end_q = next((q for q in q_list if q['key'] == 'end_date' and q['type'] == 'date_input'), None)
+                    
+                    if start_q and end_q:
+                        start_date_val = current_input_data.get('start_date')
+                        end_date_val = current_input_data.get('end_date')
+                        
+                        if isinstance(start_date_val, date) and isinstance(end_date_val, date):
+                            if end_date_val < start_date_val:
+                                validation_errors.append(f"'{end_q['label']}' cannot be before '{start_q['label']}'.")
+                    
+                    if validation_errors:
+                        for error in validation_errors:
+                            st.error(error)
+                    else:
+                        # Store current inputs before refinement
+                        st.session_state.initial_input_data = current_input_data.copy()
+                        st.session_state.review_data = {}
+                        st.session_state.final_input_data = {}
+                        
+                        # Process refinable fields
+                        with st.spinner("Analyzing inputs for refinement..."):
+                            questions_for_type = AGREEMENT_QUESTIONS.get(st.session_state.agreement_type, [])
+                            for q in questions_for_type:
+                                field_key = q['key']
+                                original_value = st.session_state.initial_input_data.get(field_key)
                                 
-                                # Skip address fields that already have city/state/zip
-                                if "address" in field_key.lower():
-                                    parts = original_value.split(',')
-                                    if len(parts) >= 3 and any(p.strip().isdigit() for p in parts):
-                                        # Already has city, state, zip format
-                                        should_skip = True
-                                
-                                if not should_skip:
-                                    # Pass all input data as context
-                                    suggested_value = refine_text_field(
-                                        str(original_value), 
-                                        q['label'], 
-                                        st.session_state.agreement_type,
-                                        st.session_state.initial_input_data  # Pass all inputs as context
-                                    )
+                                if q.get("refine", False) and isinstance(original_value, str) and original_value.strip():
+                                    should_skip = False
                                     
-                                    # Only store for review if actually different
-                                    if suggested_value != original_value:
-                                        st.session_state.review_data[field_key] = {
-                                            'original': str(original_value), 
-                                            'suggested': suggested_value
-                                        }
-                                        st.session_state.final_input_data[field_key] = suggested_value
+                                    if "address" in field_key.lower():
+                                        parts = original_value.split(',')
+                                        if len(parts) >= 3 and any(p.strip().isdigit() for p in parts):
+                                            should_skip = True
+                                    
+                                    if not should_skip:
+                                        suggested_value = refine_text_field(
+                                            str(original_value), 
+                                            q['label'], 
+                                            st.session_state.agreement_type,
+                                            st.session_state.initial_input_data
+                                        )
+                                        
+                                        if suggested_value != original_value:
+                                            st.session_state.review_data[field_key] = {
+                                                'original': str(original_value), 
+                                                'suggested': suggested_value
+                                            }
+                                            st.session_state.final_input_data[field_key] = suggested_value
+                                        else:
+                                            st.session_state.final_input_data[field_key] = original_value
                                     else:
-                                        # If no changes, use original directly
                                         st.session_state.final_input_data[field_key] = original_value
                                 else:
-                                    # Skip refinement for this field
                                     st.session_state.final_input_data[field_key] = original_value
-                            else:
-                                # No refinement for this field
-                                st.session_state.final_input_data[field_key] = original_value
 
-                    st.session_state.app_stage = 'review'
-                    st.rerun()
-    
-    # Stage 2: Review and Edit
-    elif st.session_state.app_stage == 'review':
-        st.header(f"Review & Edit: {st.session_state.agreement_type}")
-        st.markdown("---")
-        
-        st.info("Review inputs below. Edit fields marked 'Suggested Refinement'. Text starting '[Review Recommended...]' indicates potential issues (placeholders/unclear). Edit to fix or confirm.")
-        
-        questions = AGREEMENT_QUESTIONS.get(st.session_state.agreement_type, [])
-        if not questions:
-            st.error("Configuration error: No questions found for this agreement type.")
-        else:
-            col1, col2 = st.columns(2)
-            current_review_edits = {}
-            
-            for i, q in enumerate(questions):
-                target_col = col1 if i % 2 == 0 else col2
-                with target_col:
-                    field_key = q['key']
-                    label = q['label']
-                    
-                    # Check if this field had a refinement suggestion
-                    is_refined = field_key in st.session_state.review_data
-                    
-                    # Get the current value for editing
-                    value_for_editing = st.session_state.final_input_data.get(field_key, "")
-                    
-                    if is_refined:
-                        st.markdown(f"**{label}** (Suggested Refinement)")
-                        st.caption(f"Original: {st.session_state.review_data[field_key]['original']}")
+                        st.session_state.app_stage = 'review'
+                        st.rerun()
                         
-                        review_widget_key = f"review_{st.session_state.agreement_type}_{field_key}"
-                        
-                        # Check for the review warning prefix
-                        if isinstance(value_for_editing, str) and value_for_editing.startswith("[Review Recommended:"):
-                            st.warning("Input may need revision (placeholder/unclear). Please edit.")
-                            
-                        # Use text_area for potentially long refined fields
-                        edited_value = st.text_area(
-                            "Edit suggestion if needed:", 
-                            value=str(value_for_editing), 
-                            key=review_widget_key, 
-                            height=q.get("height", 100) + 20, 
-                            help=q.get("help")
-                        )
-                        
-                        current_review_edits[field_key] = edited_value
-                    else:
-                        # Display non-refined fields (read-only view)
-                        st.markdown(f"**{label}**")
-                        value_to_display = value_for_editing
-                        display_text = ""
-                        
-                        if isinstance(value_to_display, date):
-                            display_text = value_to_display.strftime('%Y-%m-%d')
-                        elif isinstance(value_to_display, list):
-                            display_text = ", ".join(map(str, value_to_display))
-                        elif isinstance(value_to_display, (int, float)):
-                            display_text = str(value_to_display)
-                        else:
-                            display_text = str(value_to_display or " ")
-                            
-                        # Use text_input for read-only display with a proper label
-                        st.text_input(
-                            f"Display {label}", 
-                            value=display_text, 
-                            key=f"display_{field_key}", 
-                            disabled=True, 
-                            label_visibility="collapsed"
-                        )
-                        
-                        # Store this value even though it wasn't edited
-                        current_review_edits[field_key] = value_to_display
-            
+        elif st.session_state.app_stage == 'review':
+            # Stage 2: Review and Edit
+            st.header(f"Review & Edit: {st.session_state.agreement_type}")
             st.markdown("---")
-            review_col1, review_col2 = st.columns(2)
             
-            with review_col1:
-                if st.button("Confirm and Generate Document", type="primary"):
-                    # Update the final input data with any edits
-                    st.session_state.final_input_data.update(current_review_edits)
-                    logger.info("Final input confirmed after review.")
-                    
-                    # Clear review suggestions as they've been processed
-                    st.session_state.review_data = {}
-                    
-                    st.session_state.app_stage = 'generating'
-                    st.rerun()
-                    
-            with review_col2:
-                if st.button("Back to Edit Inputs"):
-                    # Update initial_input_data with the reviewed/edited values
-                    st.session_state.initial_input_data.update(current_review_edits)
-                    
-                    # Clear review/final data as we are going back to the start
-                    st.session_state.review_data = {}
-                    st.session_state.final_input_data = {}
-                    
-                    st.session_state.app_stage = 'input'
-                    st.rerun()
-    
-    # Stage 3: Generating / Displaying Results
-    elif st.session_state.app_stage in ['generating', 'done']:
-        final_data_for_prompt = st.session_state.final_input_data
-        
-        if st.session_state.app_stage == 'generating':
+            st.info("Review inputs below. Edit fields marked 'Suggested Refinement'. Text starting '[Review Recommended...]' indicates potential issues (placeholders/unclear). Edit to fix or confirm.")
+            
+            questions = AGREEMENT_QUESTIONS.get(st.session_state.agreement_type, [])
+            if not questions:
+                st.error("Configuration error: No questions found for this agreement type.")
+            else:
+                col1, col2 = st.columns(2)
+                current_review_edits = {}
+                
+                for i, q in enumerate(questions):
+                    target_col = col1 if i % 2 == 0 else col2
+                    with target_col:
+                        field_key = q['key']
+                        label = q['label']
+                        
+                        is_refined = field_key in st.session_state.review_data
+                        value_for_editing = st.session_state.final_input_data.get(field_key, "")
+                        
+                        if is_refined:
+                            st.markdown(f"**{label}** (Suggested Refinement)")
+                            st.caption(f"Original: {st.session_state.review_data[field_key]['original']}")
+                            
+                            review_widget_key = f"review_{st.session_state.agreement_type}_{field_key}"
+                            
+                            if isinstance(value_for_editing, str) and value_for_editing.startswith("[Review Recommended:"):
+                                st.warning("Input may need revision (placeholder/unclear). Please edit.")
+                                
+                            edited_value = st.text_area(
+                                "Edit suggestion if needed:", 
+                                value=str(value_for_editing), 
+                                key=review_widget_key, 
+                                height=q.get("height", 100) + 20, 
+                                help=q.get("help")
+                            )
+                            
+                            current_review_edits[field_key] = edited_value
+                        else:
+                            st.markdown(f"**{label}**")
+                            value_to_display = value_for_editing
+                            display_text = ""
+                            
+                            if isinstance(value_to_display, date):
+                                display_text = value_to_display.strftime('%Y-%m-%d')
+                            elif isinstance(value_to_display, list):
+                                display_text = ", ".join(map(str, value_to_display))
+                            elif isinstance(value_to_display, (int, float)):
+                                display_text = str(value_to_display)
+                            else:
+                                display_text = str(value_to_display or " ")
+                                
+                            st.text_input(
+                                f"Display {label}", 
+                                value=display_text, 
+                                key=f"display_{field_key}", 
+                                disabled=True, 
+                                label_visibility="collapsed"
+                            )
+                            
+                            current_review_edits[field_key] = value_to_display
+                
+                st.markdown("---")
+                review_col1, review_col2 = st.columns(2)
+                
+                with review_col1:
+                    if st.button("Confirm and Generate Document", type="primary"):
+                        st.session_state.final_input_data.update(current_review_edits)
+                        logger.info("Final input confirmed after review.")
+                        st.session_state.review_data = {}
+                        st.session_state.app_stage = 'generating'
+                        st.rerun()
+                        
+                with review_col2:
+                    if st.button("Back to Edit Inputs"):
+                        st.session_state.initial_input_data.update(current_review_edits)
+                        st.session_state.review_data = {}
+                        st.session_state.final_input_data = {}
+                        st.session_state.app_stage = 'input'
+                        st.rerun()
+                        
+        elif st.session_state.app_stage == 'generating':
+            # Stage 3: Generating
             st.info("Preparing final request...")
             
             agreement_type = st.session_state.agreement_type
             jurisdiction = st.session_state.jurisdiction
             
             with st.spinner("Generating contract draft... This may take a moment."):
-                # Call the end-to-end generation pipeline
-                generated_text = generate_contract(agreement_type, jurisdiction, final_data_for_prompt)
-                
+                generated_text = generate_contract(agreement_type, jurisdiction, st.session_state.final_input_data)
                 st.session_state.generated_text = generated_text
                 st.session_state.app_stage = 'done'
                 st.rerun()
                 
-        # This replaces the existing code in the 'done' stage of your main() function
-        if st.session_state.app_stage == 'done':
-            # Check which tab is active
-            if st.session_state.active_tab == 'generate':
-                # Show the contract generation UI
+        elif st.session_state.app_stage == 'done':
+            # Stage 4: Results Display
+            # Create tabs for generation and analysis
+            generation_tab, analysis_tab = st.tabs(["Generated Contract", "Analyze Contract"])
+            
+            with generation_tab:
                 st.header(f"Generated Draft: {st.session_state.agreement_type}")
                 st.subheader(f"Governing Law: {st.session_state.jurisdiction}")
                 st.markdown("---")
@@ -1813,7 +1946,7 @@ def main():
                 if not generated_text:
                     st.error("Document generation failed. No text was produced.")
                 elif isinstance(generated_text, str):
-                    # Generation succeeded, proceed to PDF creation
+                    # Generate PDF
                     st.success("Generation complete. Preparing PDF...")
                     
                     pdf_title = f"{st.session_state.agreement_type} - Draft"
@@ -1825,7 +1958,7 @@ def main():
                         )
                         
                         if pdf_buffer:
-                            # Create a readable filename
+                            # Create filename
                             party_name_raw = st.session_state.final_input_data.get(
                                 'client_name',
                                 st.session_state.final_input_data.get(
@@ -1870,25 +2003,21 @@ def main():
                         st.subheader("Raw Output (PDF Creation Error):")
                         st.text_area("You can copy the text below:", generated_text, height=400)
                 else:
-                    # Handle cases where generate_contract returned unexpected type
                     st.warning("Generation produced unexpected output format.")
                     st.text_area("Raw Output:", str(generated_text), height=300)
                     
-            else:  # Analysis tab
-                # Show the contract analysis UI
-                st.header(f"Contract Analysis: {st.session_state.agreement_type}")
-                st.subheader(f"Governing Law: {st.session_state.jurisdiction}")
-                st.markdown("---")
-                
-                # Import the contract_analysis module if not already imported
-                from contract_analysis import render_contract_analysis_tab
-                
-                # Call the analysis UI component
-                render_contract_analysis_tab(
-                    st.session_state.generated_text, 
-                    st.session_state.agreement_type,
-                    st.session_state.jurisdiction
-                )
+            with analysis_tab:
+                # Only analyze if we have a generated contract
+                if st.session_state.generated_text:
+                    # Use the existing contract analysis code
+                    from contract_analysis import render_contract_analysis_tab
+                    render_contract_analysis_tab(
+                        st.session_state.generated_text, 
+                        st.session_state.agreement_type,
+                        st.session_state.jurisdiction
+                    )
+                else:
+                    st.warning("Please generate a contract first to analyze it.")
             
             if st.button("Start New Document", key="start_new_doc_btn"):
                 # Clear relevant session state variables
@@ -1900,18 +2029,42 @@ def main():
                 if "analysis_results" in st.session_state:
                     del st.session_state.analysis_results
                 st.rerun()
+    
+    # --------- DOCUMENT ANALYSIS MODE ---------
+    elif st.session_state.active_tab == 'document_analysis':
+        # Document analysis sidebar options
+        st.sidebar.header("Analysis Options")
+        analysis_mode = st.sidebar.radio(
+            "Analysis Type:",
+            options=["Document Analysis", "Document Q&A"],
+            key="analysis_mode_selector"
+        )
         
+        if analysis_mode == "Document Analysis":
+            # Import and render document analysis UI from document_upload_analysis.py
+            from document_upload_analysis import render_document_upload_tab
+            render_document_upload_tab(US_STATES)
+        else:
+            # Import and render document Q&A for uploaded document from document_upload_analysis.py
+            from document_upload_analysis import render_document_qa_with_uploaded
+            render_document_qa_with_uploaded()
+    
+    # --------- DOCUMENT Q&A MODE ---------
+    elif st.session_state.active_tab == 'document_qa':
+        # Render the document Q&A tab using Snowflake Cortex Search
+        render_document_qa_tab()
+    
     # Footer
     st.sidebar.divider()
     st.sidebar.markdown("""
     **QuickContractAI**
     
-    Generate and analyze contract drafts with AI assistance:
-    - Service Agreements
-    - Employment Agreements
-    - Residential Leases
+    AI-powered legal document tools:
+    - Generate contract drafts
+    - Analyze uploaded contracts
+    - Query contract database
     
-    *All drafts require legal review.*
+    *All results require legal review.*
     """)
 
 if __name__ == "__main__":

@@ -29,11 +29,16 @@ def get_analysis_model():
     )
 
 def get_summary_model():
-    """Get the model for contract summarization"""
-    return ChatOllama(
-        model="qwen2.5-coder:14b",
-        callbacks=[StreamingStdOutCallbackHandler()],
-        temperature=0.2,
+    """Get the Gemini model for contract summarization"""
+    api_key = os.getenv("GOOGLE_API_KEY")
+    if not api_key:
+        st.error("Google API key not found in environment variables.")
+        return None
+        
+    return ChatGoogleGenerativeAI(
+        model="gemini-2.5-pro-exp-03-25",  # Using the same model as analysis
+        google_api_key=api_key,
+        temperature=0.3,  # Slightly higher temperature for more creative summaries
     )
 
 # --- Contract Analysis Chains ---
@@ -50,7 +55,8 @@ def create_clause_extraction_chain():
     {contract_text}
     
     Extract and organize the following information:
-    1. Parties: Who are the parties involved in this contract?
+    1. Parties: Who are the parties involved in this contract? Be very specific and look for FULL NAMES, not just roles. 
+       Check both the main contract text AND the signature block for names of individuals or companies.
     2. Key Dates: Extract all important dates (effective date, termination date, renewal dates, etc.)
     3. Payment Terms: Extract all payment-related information (amounts, schedules, penalties)
     4. Obligations: List the primary obligations of each party
