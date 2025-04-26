@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Environment / secrets
+.env
+.env.local
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Pile of Law data + intermediate artifacts produced by
+# precheck_before_snowflake_pol.ipynb (regenerate locally; do not commit).
+pile_of_law_data/
+pile_of_law_decompressed/
+parsed_docs_batches/
+chunked_docs_batches/
+
+# OS noise
+.DS_Store
+Thumbs.db
