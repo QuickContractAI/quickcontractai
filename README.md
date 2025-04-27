@@ -14,7 +14,7 @@ An AI-powered legal document generation and analysis tool that helps create, ana
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/yourusername/quickcontractai.git
+git clone https://github.com/QuickContractAI/quickcontractai.git
 cd quickcontractai
 ```
 
@@ -39,7 +39,7 @@ GOOGLE_API_KEY=
 
 SNOWFLAKE_ACCOUNT=
 
-SNOWFLAKE_
+SNOWFLAKE_USER= 
 
 SNOWFLAKE_PASSWORD=
 
@@ -51,6 +51,48 @@ SNOWFLAKE_DATABASE=
 
 SNOWFLAKE_SCHEMA=
 
+
+## Snowflake provisioning
+
+The RAG layer is backed by a Cortex Search Service over a chunked copy of the
+[Pile of Law](https://huggingface.co/datasets/pile-of-law/pile-of-law) corpus.
+The first time you stand the project up, run these steps in order:
+
+1. **Create the database, schema, and target table.** From a Snowflake worksheet
+   (or `snowsql`) run:
+   ```sql
+   !source snowflake_setup.sql
+   ```
+   This creates `LAWS_CONTRACTS.TEXT.DOCS_CHUNKS_TABLE` with the
+   `SOURCE / CHUNK / DOC_INDEX / CHUNK_INDEX` schema the app expects.
+
+2. **Download, chunk, and upload the corpus.** Open
+   `precheck_before_snowflake_pol.ipynb` and run cells `[1]`–`[6]` end-to-end.
+   The notebook:
+   - downloads 7 Pile of Law subsets (Atticus Contracts, Resource Contracts,
+     ToS, CFPB Consumer Credit, US Code, State Codes, CFR) — ~122K documents,
+   - decompresses the `.jsonl.xz` files and normalizes whitespace,
+   - splits each document into ~1024-character chunks with 200-char overlap
+     via `RecursiveCharacterTextSplitter` (≈16.8M chunks total),
+   - uploads the chunks into `DOCS_CHUNKS_TABLE` via Snowpark in parallel
+     batches of 10K records.
+
+3. **Build the Cortex Search Service.** Once the table is populated:
+   ```sql
+   !source snowflake_cortex_service.sql
+   ```
+   This creates `laws_search_service` on top of `DOCS_CHUNKS_TABLE` using the
+   `snowflake-arctic-embed-l-v2.0` embedding model. The initial embedding pass
+   over 16.8M chunks takes a few hours on the `DAMG7374` warehouse — poll
+   `SHOW CORTEX SEARCH SERVICES` until `indexing_state = ACTIVE` before
+   smoke-testing.
+
+4. **Verify retrieval from Python.** Run `python snowflake_test.py` to
+   confirm `SEARCH_PREVIEW` returns chunks plus their full-text pivot.
+
+After step 4 succeeds the Streamlit app can be launched normally; the
+`SnowflakeCortexRetriever` in `app.py` will talk to `laws_search_service`
+directly.
 
 ## Overview
 
@@ -69,6 +111,16 @@ QuickContractAI streamlines the contract lifecycle with three main functions:
 - Automatic validation for consistency and completeness
 - Export to professionally formatted PDF documents
 - Jurisdictional customization for all 50 US states
+- **CUAD-grounded few-shot prompting** — the draft chain is primed with
+  exemplar clauses paraphrased from the Contract Understanding Atticus
+  Dataset so the model mimics real commercial-contract structure (see
+  `cuad_few_shots.py`)
+- **Privacy-preserving cloud step** — before any request to Gemini, party
+  names, addresses, and financial figures are swapped on-device for
+  opaque tokens (`[PARTY_1]`, `[ADDRESS_1]`, `[AMOUNT_1]`); originals are
+  re-injected locally after the draft returns (see `privacy.py`).
+  Local refinement and validation chains (Ollama) operate on the real
+  values throughout.
 
 ### Document Analysis
 - Extract key clauses and terms from any contract document
